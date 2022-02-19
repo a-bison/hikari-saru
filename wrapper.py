@@ -215,7 +215,7 @@ class Saru:
         else:
             logger.info(f"Left guild: {g.name}({g.id}")
 
-        self.gs_db.delete(event.guild_id)
+        await self.gs_db.delete(event.guild_id)
 
     # Enqueue a new job. Returns the created job object.
     async def start_job(
@@ -273,8 +273,8 @@ class Saru:
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
     # guild property.
-    def gs(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity):
-        return self.gs_db.get(state_type, guild_entity)
+    async def gs(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity):
+        return await self.gs_db.get(state_type, guild_entity)
 
 
 ######################################
@@ -463,14 +463,14 @@ class GuildStateDB:
         del self.types[k]
         del self.statedb[k]
 
-    def _get_guild_and_id(self, guild_entity: Optional[GuildEntity]) -> tuple[hikari.Guild, int]:
+    async def _get_guild_and_id(self, guild_entity: Optional[GuildEntity]) -> tuple[hikari.Guild, int]:
         if guild_entity is None:
             raise GuildRequiredException()
 
         if isinstance(guild_entity, hikari.Guild):
             guild = guild_entity
         elif isinstance(guild_entity, int):
-            guild = self.bot.rest.fetch_guild(guild_entity)
+            guild = await self.bot.rest.fetch_guild(guild_entity)
         else:
             raise TypeError("Guild key must be guild, or be an integer.")
 
@@ -494,8 +494,8 @@ class GuildStateDB:
 
     # Get a state instance from the DB. If there's no
     # instance for the given guild, one will be created.
-    def get(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity) -> GuildStateBase:
-        guild, guild_id = self._get_guild_and_id(guild_entity)
+    async def get(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity) -> GuildStateBase:
+        guild, guild_id = await self._get_guild_and_id(guild_entity)
         state_type, guild_states = self.__get_of_type(state_type)
 
         try:
@@ -506,8 +506,8 @@ class GuildStateDB:
             return gs
 
     # Clear all state associated with the given guild.
-    def delete(self, guild_entity: GuildEntity) -> None:
-        _, guild_id = self._get_guild_and_id(guild_entity)
+    async def delete(self, guild_entity: GuildEntity) -> None:
+        _, guild_id = await self._get_guild_and_id(guild_entity)
 
         for states in self.statedb.values():
             if guild_id in states:
