@@ -1,84 +1,34 @@
-from discord.ext import commands
-
 import json
 
+from collections.abc import Mapping
+from typing import Sequence
+
+import lightbulb
 
 # Character to use to acknowledge commands. Defaults to a check mark.
-__ack_char = "\U00002705"
+__ack_char: str = "\U00002705"
 
 
-def override_ack_emoji(emoji):
+def override_ack_emoji(emoji: str) -> None:
     global __ack_char
 
     __ack_char = emoji
 
 
-def check_administrator():
-    async def predicate(ctx):
-        return ctx.author.guild_permissions.administrator
-
-    return commands.check(predicate)
+async def ack(ctx: lightbulb.Context) -> None:
+    """React with an emoji for confirmation. By default, this is a checkmark."""
+    await ctx.event.message.add_reaction(__ack_char)
 
 
-# Workaround until I read the docs better
-async def process_user_optional(ctx, member, rest):
-    too_many_args = "Too many arguments. Try \"{}\"."
-    nosuchuser = "Could not find user {}. Try exact case or a mention."
-
-    if member and rest:
-        correct = " ".join([member.name, *rest])
-        await ctx.send(too_many_args.format(correct))
-        return None
-
-    if not member and rest:
-        # the member conversion failed.
-        if len(rest) > 1:
-            await ctx.send(too_many_args.format(" ".join(rest)))
-            return None
-
-        await ctx.send(nosuchuser.format(rest[0]))
-        return None
-
-    if not member:
-        return ctx.author
-
-    return member
-
-
-# React with a check mark for confirmation
-async def ack(ctx):
-    await ctx.message.add_reaction(__ack_char)
-
-
-def code(s):
+def code(s: str) -> str:
     # Note: Not using any format()s here, so we can construct format strings
     # using the util.code* funcs
     return "```\n" + s + "\n```"
 
 
-def codelns(lns):
+def codelns(lns: Sequence[str]) -> str:
     return code("\n".join(lns))
 
 
-def codejson(j):
+def codejson(j: Mapping) -> str:
     return code(json.dumps(j, indent=4))
-
-
-# More primitive wrapper that does not set the __wrapped__ attribute.
-# This forces the command decorator to use the wrapper function annotations
-# for parameter checking, rather than the wrapped function's annotations.
-#
-# If specified, entity specifies what group this command should be added to.
-def command_wraps(wrapped, entity=commands, *args, **kwargs):
-    if entity is None:
-        entity = commands
-
-    def decorator(wrapper):
-        wrapper.__name__ = wrapped.__name__
-        wrapper.__qualname__ = wrapped.__qualname__
-        wrapper.__doc__ = wrapped.__doc__
-        wrapper.__module__ = wrapped.__module__
-
-        return entity.command(*args, **kwargs)(wrapper)
-
-    return decorator

@@ -1,29 +1,56 @@
-import discord
-from discord.ext import commands
-
-from datetime import datetime
 import asyncio
-import inspect
-import json
+import os
+import pathlib
 import logging
 import time
-import typing
+from typing import Optional, Union, Type, Any
+
+import hikari
+import lightbulb
 
 from . import job
 from . import config
-from . import util
-from .exception import NotAdministrator
-from .util import ack
+
+from collections.abc import Mapping, MutableMapping, Iterator
 
 logger = logging.getLogger(__name__)
 
 
-# High level interface to the bot core.
-# Automatically links together cfg and job systems, and subscribes to
-# discord events.
-class CoreWrapper(commands.Bot):
-    def __init__(self, config_path, *args, cfgtemplate={}, common_cfgtemplate={}, **kwargs):
-        super().__init__(*args, **kwargs)
+GuildEntity = Union[int, hikari.Guild]
+
+
+class GuildStateBase:
+    def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
+        self.bot = bot
+        self.guild = guild
+
+
+# Attach a new instance of Saru to a BotApp.
+def attach(
+    bot: lightbulb.BotApp,
+    *args: Any,
+    **kwargs: Any
+) -> None:
+    saru = Saru(bot, *args, **kwargs)
+    bot.d.saru = saru
+
+    # Events
+    bot.subscribe(hikari.StartedEvent, saru.on_bot_ready)
+    bot.subscribe(hikari.GuildJoinEvent, saru.on_bot_guild_join)
+    bot.subscribe(hikari.GuildLeaveEvent, saru.on_bot_guild_leave)
+
+
+class Saru:
+    """Container class implementing a set of tools with Saru."""
+    def __init__(
+        self,
+        bot: lightbulb.BotApp,
+        config_path: pathlib.Path,
+        cfgtemplate: Mapping = {},
+        common_cfgtemplate: Mapping = {}
+    ):
+        self.bot = bot
+        self.loop = asyncio.get_event_loop()
 
         self.__cfgtemplate = cfgtemplate
 
@@ -33,6 +60,9 @@ class CoreWrapper(commands.Bot):
             # with old ones
             "last_schedule_id": 0
         }
+
+        if not config_path.exists():
+            os.makedirs(config_path)
 
         self.config_db = config.JsonConfigDB(
             config_path / "guildcfg",
@@ -50,7 +80,7 @@ class CoreWrapper(commands.Bot):
                 "cron": {}
             }
         )
-        self.gs_db = GuildStateDB(self)
+        self.gs_db = GuildStateDB(self.bot)
         self.monkycfg = self.common_config_db.get_config("_monky")
 
         # Task registry
@@ -61,7 +91,7 @@ class CoreWrapper(commands.Bot):
         self.jobqueue.on_job_submit(self._cfg_job_create)
         self.jobqueue.on_job_stop(self._cfg_job_delete)
         self.jobqueue.on_job_cancel(self._cfg_job_delete)
-        self.jobfactory = DiscordJobFactory(self.task_registry, self)
+        self.jobfactory = DiscordJobFactory(self.task_registry, self.bot)
         self.jobtask = None
 
         # Job scheduler component
@@ -74,21 +104,47 @@ class CoreWrapper(commands.Bot):
         )
         self.crontask = None
 
-        # Register discord events
-        self.add_listener(self.__on_guild_join, 'on_guild_join')
-        self.add_listener(self.__on_guild_remove, 'on_guild_remove')
-        self.add_listener(self.__on_ready, 'on_ready')
-
-        self.jobs_resumed = False
+        self.is_ready = False
 
         # Create job consumer and scheduler
         loop = self.loop
         self.jobtask = loop.create_task(self.jobqueue.run())
         self.crontask = loop.create_task(self.jobcron.run())
 
-    ##################
-    # EVENT HANDLERS #
-    ##################
+    # Get the config object for a given job/cron header.
+    def get_jobcfg_for_header(self, header: Union[job.JobHeader, job.CronHeader]) -> config.JsonConfig:
+        cfg = self.job_db.get_config(header.guild_id)
+        return cfg
+
+    # INTERNAL JOB EVENTS
+
+    # When a job is submitted, create an entry in the config DB.
+    async def _cfg_job_create(self, header: job.JobHeader) -> None:
+        cfg = self.get_jobcfg_for_header(header)
+        cfg.sub("jobs").set(str(header.id), header.as_dict())
+
+    # Once a job is done, delete it from the config db.
+    async def _cfg_job_delete(self, header: job.JobHeader) -> None:
+        cfg = self.get_jobcfg_for_header(header)
+        cfg.sub("jobs").delete(str(header.id), ignore_keyerror=True)
+
+    # Add created schedules to the config DB, and increase the
+    # last_schedule_id parameter.
+    async def _cfg_sched_create(self, header: job.CronHeader) -> None:
+        cfg = self.get_jobcfg_for_header(header)
+        cfg.sub("cron").set(str(header.id), header.as_dict())
+
+        self.monkycfg.get_and_set(
+            "last_schedule_id",
+            lambda val: max(val, header.id)
+        )
+
+    # Remove deleted schedules from the config DB.
+    async def _cfg_sched_delete(self, header: job.CronHeader) -> None:
+        cfg = self.get_jobcfg_for_header(header)
+        cfg.sub("cron").delete(str(header.id))
+
+    # DISCORD LINKS
 
     # Resume all jobs that never properly finished from the last run.
     # Called from on_ready() to ensure that all discord state is init'd
@@ -119,46 +175,13 @@ class CoreWrapper(commands.Bot):
             msg = "Loaded {} schedule(s) in guild {}"
             logger.info(msg.format(len(crons), guild_id))
 
-    # Get the config object for a given job/cron header.
-    def get_jobcfg_for_header(self, header):
-        guild = self.get_guild(header.guild_id)
-        cfg = self.job_db.get_config(guild.id)
-
-        return cfg
-
     async def reschedule_cron(self, header_dict):
         header = await self.cronfactory.create_cronheader_from_dict(header_dict)
         await self.jobcron.create_schedule(header)
 
-    # When a job is submitted, create an entry in the config DB.
-    async def _cfg_job_create(self, header):
-        cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("jobs").set(str(header.id), header.as_dict())
-
-    # Once a job is done, delete it from the config db.
-    async def _cfg_job_delete(self, header):
-        cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("jobs").delete(str(header.id), ignore_keyerror=True)
-
-    # Add created schedules to the config DB, and increase the
-    # last_schedule_id parameter.
-    async def _cfg_sched_create(self, header):
-        cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("cron").set(str(header.id), header.as_dict())
-
-        self.monkycfg.get_and_set(
-            "last_schedule_id",
-            lambda val: max(val, header.id)
-        )
-
-    # Remove deleted schedules from the config DB.
-    async def _cfg_sched_delete(self, header):
-        cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("cron").delete(str(header.id))
-
-    # Create configs for any guilds we were added to while offline
     async def join_guilds_offline(self):
-        async for guild in self.fetch_guilds():
+        """Create config entries for any guilds that were joined while offline."""
+        async for guild in self.bot.rest.fetch_my_guilds(newest_first=True):
             logger.info("In guilds: {}({})".format(guild.name, guild.id))
             _ = self.config_db.get_config(guild.id)
             _ = self.job_db.get_config(guild.id)
@@ -166,55 +189,55 @@ class CoreWrapper(commands.Bot):
         self.config_db.write_db()
         self.job_db.write_db()
 
-    async def __on_ready(self):
-        if not self.jobs_resumed:
+    async def on_bot_ready(self, event: hikari.StartedEvent) -> None:
+        """Function to call when bot is started and connected. This function MUST be called in order for jobs to
+        resume properly."""
+        if not self.is_ready:
             await self.reschedule_all_cron()
             await self.resume_jobs()
-            self.jobs_resumed = True
+            await self.join_guilds_offline()
 
-        logger.info("Core ready.")
+            self.is_ready = True
 
-    # NOTE
-    # There's no need to create a cfg or guildstate on guild join,
-    # because those objects will be created the first time they're
-    # accessed.
-    async def __on_guild_join(self, guild):
-        logger.info("Joined new guild: {}({})".format(guild.name, guild.id))
+        logger.info("Saru ready.")
 
-    # On leave however, we need to delete non-persistent guild state, to
-    # prevent any strangeness. As a policy we remember config of guilds
-    # we were in previously. FIXME Might need to come back to that
-    async def __on_guild_remove(self, guild):
-        logger.info("Left guild: {}({})".format(guild.name, guild.id))
-        self.gs_db.delete(guild)
+    async def on_bot_guild_join(self, event: hikari.GuildJoinEvent):
+        """Optional guild join event handler."""
+        g = event.guild
+        logger.info(f"Joined new guild: {g.name}({g.id})")
 
-    #########################
-    # UTILITY / PASSTHROUGH #
-    #########################
+    async def on_bot_guild_leave(self, event: hikari.GuildLeaveEvent):
+        """Guild leave event handler. Must be fired in order to avoid corruption of guild state DB."""
+        g = event.old_guild
+        if g is None:
+            logger.info(f"Left guild: {event.guild_id}(cache miss)")
+        else:
+            logger.info(f"Left guild: {g.name}({g.id}")
 
-    def run(self, secret):
-        loop = self.loop
-
-        try:
-            # Perform initialization and log in
-            loop.run_until_complete(self.login(secret))
-            loop.run_until_complete(self.join_guilds_offline())
-            loop.run_until_complete(self.connect())
-
-        except KeyboardInterrupt:
-            print("Keyboard Interrupt!")
-        finally:
-            loop.close()
+        self.gs_db.delete(event.guild_id)
 
     # Enqueue a new job. Returns the created job object.
-    async def start_job(self, ctx, task_type, properties):
+    async def start_job(
+        self,
+        ctx: lightbulb.Context,
+        task_type: str,
+        properties: Mapping
+    ) -> job.Job:
+
         job = await self.jobfactory.create_job(ctx, task_type, properties)
         await self.jobqueue.submit_job(job)
 
         return job
 
     # Schedule a job
-    async def schedule_job(self, ctx, task_type, properties, cron_str):
+    async def schedule_job(
+        self,
+        ctx: lightbulb.Context,
+        task_type: str,
+        properties: Mapping,
+        cron_str: str
+    ) -> job.CronHeader:
+
         chdr = await self.cronfactory.create_cronheader(
             ctx,
             properties,
@@ -226,23 +249,30 @@ class CoreWrapper(commands.Bot):
         return chdr
 
     # Register a task class.
-    def task(self, tsk):
-        return self.task_registry.register(tsk)
+    def task(self, tsk: Type[job.JobTask]) -> None:
+        self.task_registry.register(tsk)
+
+    # Register a guild state class.
+    def gstype(self, state_type: Type[GuildStateBase]) -> None:
+        self.gs_db.register_cls(state_type)
 
     # Shortcut to get the config for a given command.
     # Also supports messages.
-    def cfg(self, ctx):
-        cfg = self.config_db.get_config(ctx.guild.id)
-        return cfg
+    def cfg(self, guild_entity: GuildEntity):
+        if isinstance(guild_entity, hikari.Guild):
+            id = guild_entity.id
+        elif isinstance(guild_entity, int):
+            id = guild_entity
+        else:
+            raise TypeError("GuildEntity must be either guild or integer.")
 
-    # Register a guild state class.
-    def gstype(self, state_type):
-        self.gs_db.register_cls(state_type)
+        cfg = self.config_db.get_config(id)
+        return cfg
 
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
     # guild property.
-    def gs(self, state_type, guild_entity):
+    def gs(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity):
         return self.gs_db.get(state_type, guild_entity)
 
 
@@ -253,18 +283,29 @@ class CoreWrapper(commands.Bot):
 
 # Implementation of discord-specific aspects of constructing job objects.
 class DiscordJobFactory(job.JobFactory):
-    def __init__(self, task_registry, bot):
+    def __init__(
+        self,
+        task_registry: job.TaskRegistry,
+        bot: lightbulb.BotApp
+    ):
         super().__init__(task_registry)
         self.bot = bot
 
     # Create a new jobheader.
-    async def create_jobheader(self, ctx, properties, task_type, schedule_id):
+    async def create_jobheader(
+        self,
+        ctx: lightbulb.Context,
+        properties: Mapping,
+        task_type: str,
+        schedule_id: Optional[int]
+    ) -> job.JobHeader:
+
         header = job.JobHeader(
             self.next_id(),
             task_type,
             properties,
-            ctx.message.author.id,
-            ctx.guild.id,
+            ctx.author.id,
+            ctx.guild_id,
             int(time.time()),
             schedule_id
         )
@@ -272,7 +313,14 @@ class DiscordJobFactory(job.JobFactory):
         return header
 
     # Create a new job.
-    async def create_job(self, ctx, task_type, properties, schedule_id=None):
+    async def create_job(
+        self,
+        ctx: lightbulb.Context,
+        task_type: str,
+        properties: Mapping,
+        schedule_id: Optional[int] = None
+    ) -> job.Job:
+
         task_type = self.task_registry.force_str(task_type)
         header = await self.create_jobheader(ctx, properties, task_type, schedule_id)
         j = await self.create_job_from_jobheader(header)
@@ -281,9 +329,13 @@ class DiscordJobFactory(job.JobFactory):
     # OVERRIDE
     # Discord tasks take some extra constructor parameters, so we need to
     # construct those jobs through the DiscordJobFactory.
-    async def create_task(self, header, guild=None):
+    async def create_task(
+        self,
+        header: job.JobHeader,
+        guild: Optional[hikari.Guild] = None
+    ) -> job.JobTask:
         if guild is None:
-            guild = self.bot.get_guild(header.guild_id)
+            guild = self.bot.rest.fetch_guild(header.guild_id)
 
         task_cls = self.task_registry.get(header.task_type)
         task = task_cls(self.bot, guild)
@@ -293,23 +345,34 @@ class DiscordJobFactory(job.JobFactory):
 
 # Companion to the JobFactory. No core.job counterpart.
 class DiscordCronFactory:
-    def __init__(self, registry, start_id=0):
+    def __init__(
+        self,
+        registry: job.TaskRegistry,
+        start_id: int = 0
+    ):
         self.task_registry = registry
         self.id_counter = job.CountingIdGenerator(start_id)
 
-    async def create_cronheader(self, ctx, properties, task_type, cron_str):
+    async def create_cronheader(
+        self,
+        ctx: lightbulb.Context,
+        properties: Mapping,
+        task_type: str,
+        cron_str: str
+    ) -> job.CronHeader:
         header = job.CronHeader(
             self.id_counter.next_id(),
             self.task_registry.force_str(task_type),
             properties,
-            ctx.message.author.id,
-            ctx.guild.id,
+            ctx.author.id,
+            ctx.guild_id,
             cron_str
         )
 
         return header
 
-    async def create_cronheader_from_dict(self, header_dict):
+    @staticmethod
+    async def create_cronheader_from_dict(header_dict: Mapping) -> job.CronHeader:
         return job.CronHeader.from_dict(header_dict)
 
 
@@ -359,427 +422,6 @@ class MessageTask(job.JobTask):
         return fmt.format(msg, p["post_interval"], p["post_number"])
 
 
-########
-# COGS #
-########
-# Cogs for use with the core. Implements some generic management and debugging
-# behavior for administrators.
-
-# Optional cog containing job management commands for testing/administration
-# NOTE: This cog requires the Members intent.
-class JobManagementCog(commands.Cog, name="Job Management"):
-    def __init__(self, core):
-        self.core = core
-        self.jq = core.jobqueue
-        self.jc = core.jobcron
-        self.registry = core.task_registry
-
-    def pretty_print_job(self, job):
-        h = job.header
-        owner = self.core.get_user(h.owner_id).name
-        s = "{}: owner={} type={}".format(h.id, owner, h.task_type)
-
-        if h.schedule_id is not None:
-            s += " sched=" + str(h.schedule_id)
-
-        task_str = job.task.display(job.header)
-
-        if task_str:
-            s += " " + task_str
-
-        return s
-
-    # Get jobs valid for a specific guild.
-    def get_guild_jobs(self, guild):
-        return {id: j for id, j in self.jq.jobs.items()
-                if j.header.guild_id == guild.id}
-
-    def job_can_modify(self, ctx, owner_id):
-        return (
-            ctx.author.guild_permissions.administrator or
-            owner_id == ctx.author.id
-        )
-
-    @commands.group(aliases=["jobs"], invoke_without_command=True)
-    async def job(self, ctx):
-        """View or modify actively queued jobs."""
-        await ctx.send("Specify a subcommand.")
-        await ctx.send_help("job")
-
-    # List jobs for a given guild.
-    @job.command(name="list")
-    async def joblist(self, ctx):
-        """List enqueued jobs."""
-        jobs = self.get_guild_jobs(ctx.guild)
-        joblines = [self.pretty_print_job(j) for j in jobs.values()]
-
-        if joblines:
-            await ctx.send(util.codelns(joblines))
-        else:
-            await ctx.send("No jobs.")
-
-    @job.command(name="raw")
-    async def jobraw(self, ctx, id: int):
-        """Print the internal representation of a job. Mostly for debugging."""
-        jobs = self.get_guild_jobs(ctx.guild)
-
-        if id in jobs:
-            await ctx.send(util.codejson(jobs[id].header.as_dict()))
-        else:
-            await ctx.send("Job {} does not exist.".format(id))
-
-    @job.command(name="cancel")
-    async def jobcancel(self, ctx, id: int):
-        """Cancel a job listed in the job list.
-
-        Members may only cancel jobs they started. Users with the Administrator
-        permission may cancel any job.
-        """
-        jobs = self.get_guild_jobs(ctx.guild)
-
-        if id in jobs:
-            if not self.job_can_modify(ctx, jobs[id].header.owner_id):
-                raise NotAdministrator("cancel jobs started by other users")
-
-            await self.jq.canceljob(id)
-            await ack(ctx)
-        else:
-            await ctx.send("Job {} does not exist.".format(id))
-
-    @job.command(name="canceluser")
-    async def jobcanceluser(self, ctx, user: typing.Optional[discord.Member], *rest):
-        """Cancel all jobs started by a specific user.
-
-        Unless you're administrator, you'll only be able to cancel your
-        own jobs.
-        """
-        corrected_user = await util.process_user_optional(ctx, user, rest)
-
-        if corrected_user is None:
-            return
-
-        if not self.job_can_modify(ctx, corrected_user.id):
-            raise NotAdministrator("cancel jobs started by other users")
-
-        jobs = [j for _, j in self.get_guild_jobs(ctx.guild).items()
-                if j.header.owner_id == corrected_user.id]
-
-        if not jobs:
-            await ctx.send("No jobs to delete.")
-            return
-
-        for j in reversed(jobs):
-            await self.jq.canceljob(j.header.id)
-
-        await ack(ctx)
-
-    @job.command(name="cancelall")
-    @util.check_administrator()
-    async def jobcancelall(self, ctx):
-        """Cancel all jobs. Only Administrators may use this command.
-        """
-        jobs = self.get_guild_jobs(ctx.guild)
-
-        for id, jobs in reversed(jobs.items()):
-            await self.jq.canceljob(id)
-
-        await ack(ctx)
-
-    @job.command("flush")
-    @commands.is_owner()
-    async def jobflush(self, ctx):
-        """Cancel all jobs currently scheduled, across all servers.
-
-        You must be the owner of the bot to use this command.
-        """
-        for id in reversed(self.jq.jobs.keys()):
-            await self.jq.canceljob(id)
-
-        await ack(ctx)
-
-    def pretty_print_cron(self, cron):
-        owner = self.core.get_user(cron.owner_id).name
-
-        s = "{}: owner={} type={} sched=\"{}\" params={} nextrun=\"{}\""
-        s = s.format(
-            cron.id,
-            owner,
-            cron.task_type,
-            cron.schedule,
-            str(cron.properties),
-            cron.next.strftime("%c") if cron.next is not None else "null"
-        )
-
-        return s
-
-    @commands.group(aliases=["schedule"], invoke_without_command=True)
-    async def cron(self, ctx):
-        """View or modify scheduled jobs."""
-        await ctx.send("Specify a subcommand.")
-        await ctx.send_help("cron")
-
-    # Run a generic cron cmd.
-    async def _run_croncmd(self, coro, ctx, cron_id, *args, require_ownership=False):
-        crons = self.jc.sched_filter(guild_id=ctx.guild.id)
-
-        if cron_id in crons:
-            cron = crons[cron_id]
-
-            cron_can_modify = (
-                    ctx.author.guild_permissions.administrator or
-                    cron.owner_id == ctx.member.id
-            )
-
-            if require_ownership and not cron_can_modify:
-                raise NotAdministrator("force run schedules created by other users")
-
-            try:
-                # If a method is supplied, no need to feed in self
-                if inspect.ismethod(coro):
-                    await coro(ctx, cron, *args)
-                else:
-                    await coro(self, ctx, cron, *args)
-            except job.ScheduleParseException as e:
-                # Catch any schedule parse exceptions that might happen
-                msg = "Could not parse cron str \"{}\": {}"
-                await ctx.send(msg.format(e.cronstr, str(e)))
-        else:
-            await ctx.send("Schedule {} does not exist.".format(cron_id))
-
-    # A command that operates on a single schedule entry by ID.
-    # coro must be coro(self, ctx, cron)
-    def _croncmd(entity=commands, name=None, **run_croncmd_args):
-        def decorator(coro):
-            nonlocal name
-
-            if name is None:
-                name = coro.__name__
-
-            @util.command_wraps(coro, entity=entity, name=name)
-            async def run(self, ctx, id: int):
-                await self._run_croncmd(coro, ctx, id, **run_croncmd_args)
-
-            return run
-
-        return decorator
-
-    @cron.command(name="list")
-    async def cronlist(self, ctx):
-        """List scheduled jobs."""
-        crons = self.jc.sched_filter(guild_id=ctx.guild.id)
-        cronlines = [self.pretty_print_cron(cron) for cron in crons.values()]
-
-        if cronlines:
-            await ctx.send(util.codelns(cronlines))
-        else:
-            await ctx.send("Nothing scheduled.")
-
-    @cron.command(name="create")
-    @commands.is_owner()
-    async def croncreate(self, ctx, task_type: str, cronstr: str, *, params_json):
-        """Create a schedule for an arbitrary job. Bot owner only."""
-        if task_type not in self.registry:
-            await ctx.send("Task type \"{}\" is not available.".format(
-                task_type
-            ))
-            return
-
-        params_json = params_json.strip()
-
-        if params_json:
-            params_dict = json.loads(params_json)
-        else:
-            params_dict = {}
-
-        try:
-            await self.core.schedule_job(ctx, task_type, params_dict, cronstr)
-            await ack(ctx)
-
-        except job.ScheduleParseException as e:
-            msg = "Could not parse cron str \"{}\": {}"
-            await ctx.send(msg.format(e.cronstr, str(e)))
-
-    @_croncmd(cron, name="raw")
-    async def cronraw(self, ctx, cron):
-        """Print the internal representation of a schedule."""
-        await ctx.send(util.codejson(cron.as_dict()))
-
-    @_croncmd(cron, name="delete", require_ownership=True)
-    async def crondelete(self, ctx, cron):
-        """Delete a schedule."""
-        await self.jc.delete_schedule(cron.id)
-        await ack(ctx)
-
-    @_croncmd(cron, name="force", require_ownership=True)
-    async def cronforce(self, ctx, cron):
-        """Force a scheduled job to run immediately."""
-        await self.jc.run_now(cron.id)
-        await ack(ctx)
-
-    # TODO: Find a more compact way to express cron cmds that take extra
-    # arguments
-    async def _cronreschedule(self, ctx, cron, cronstr):
-        await self.jc.reschedule(cron.id, cronstr)
-        await ack(ctx)
-
-    @cron.command(name="reschedule")
-    async def cronreschedule(self, ctx, id: int, cronstr: str):
-        """Reschedule a cron job."""
-        await self._run_croncmd(
-            self._cronreschedule, ctx, id, cronstr, require_ownership=True
-        )
-
-    @cron.command(name="flush")
-    @commands.is_owner()
-    async def cronflush(self, ctx):
-        """Delete all schedules, and reset ID counter to 0. Bot owner only."""
-        for id, cron in self.jc.sched_copy():
-            await self.jc.delete_schedule(id)
-
-        await self.core.monkycfg.set("last_schedule_id", 0)
-        await ack(ctx)
-
-
-# Optional cog for debugging core.job library functions
-class JobDebugCog(commands.Cog, name="Job Debug"):
-    @commands.command()
-    async def testcronparse(self, ctx, cron: str):
-        """Test parsing of cron strings."""
-        try:
-            s_dict = job.cron_parse(cron)
-        except job.ScheduleParseException as e:
-            await ctx.send("Could not parse cron str: " + str(e))
-            return
-
-        await ctx.send(util.codejson(s_dict))
-
-    @commands.command()
-    async def testcronmatch(self, ctx, cron: str, date_time: str):
-        """Test matching a cron string to a date.
-
-        Date must be provided in ISO format:
-        YYYY-MM-DDThh:mm:ss
-        """
-        try:
-            if job.cron_match(cron, datetime.fromisoformat(date_time)):
-                await ctx.send("Schedule match.")
-            else:
-                await ctx.send("No match.")
-
-        except job.ScheduleParseException as e:
-            await ctx.send("Could not parse cron str: " + str(e))
-            return
-        except ValueError as e:
-            await ctx.send(str(e))
-            return
-
-    @commands.command()
-    async def testcronnext(self, ctx, cron: str, date_time: typing.Optional[str]):
-        """Test functionality to predict next run of a cron schedule.
-
-        Date must be provided in ISO format:
-        YYYY-MM-DDThh:mm:ss
-
-        If date_time is not given, the current date will be used instead.
-        """
-        try:
-            if date_time is None:
-                date_time = datetime.now()
-            else:
-                date_time = datetime.fromisoformat(date_time)
-
-            s = job.cron_parse(cron)
-        except job.ScheduleParseException as e:
-            await ctx.send("Could not parse cron str: " + str(e))
-            return
-        except ValueError as e:
-            await ctx.send(str(e))
-            return
-
-        next_date_time = job.cron_next_date_as_datetime(s, date_time)
-
-        message = util.codelns([
-            "From {}",
-            "{} will next run",
-            "     {}"
-        ])
-
-        await ctx.send(message.format(
-            date_time.strftime("%c"),
-            cron,
-            next_date_time.strftime("%c")
-        ))
-
-
-class ConfigCogBase(commands.Cog):
-    def __init__(self, core):
-        self.core = core
-
-    # Decorator for creating a simple config command that sets/gets
-    # one config option. For example:
-    #
-    # @ConfigCogBase.cfg_command()
-    # async def config_option_name(*_):
-    #     pass
-    #
-    # Would produce a command called "config-option-name", where
-    #
-    # "w!config-option-name" gets the config "config_option_name" and prints it.
-    # "w!config-option-name value" sets the config to "value".
-    #
-    # The body of the function is called immediately before the value
-    # is set, so it may be used for additional validation/processing.
-    # TODO Currently only supports guild cfg. Support common cfg too.
-    @staticmethod
-    def cfg_command(
-            converter=None,
-            cfg_key=None,
-            require_admin=True,
-            **kwargs):
-
-        def decorator(coro):
-            if "name" not in kwargs:
-                kwargs["name"] = coro.__name__.replace("_", "-")
-
-            @util.command_wraps(coro, **kwargs)
-            async def go(self, ctx, value: typing.Optional[str]):
-                cfg = self.core.cfg(ctx)
-
-                if cfg_key is None:
-                    key = coro.__name__
-                else:
-                    key = cfg_key
-
-                # GET
-                if value is None:
-                    display_name = key.replace("_", " ").capitalize()
-                    value = cfg.get(key)
-                    await ctx.reply("{} is {}.".format(display_name, value))
-                    return
-
-                # SET
-                if require_admin and not ctx.author.guild_permissions.administrator:
-                    await ctx.reply("You must be administrator to set this value.")
-                    return
-
-                if converter is not None:
-                    value = converter(value)
-
-                await coro(self, ctx, cfg, key, value)
-                cfg.set(key, value)
-                await ack(ctx)
-
-            return go
-
-        return decorator
-
-
-class GuildStateBase:
-    def __init__(self, bot, guild):
-        self.bot = bot
-        self.guild = guild
-
-
 class GuildStateException(Exception):
     pass
 
@@ -791,16 +433,16 @@ class GuildRequiredException(GuildStateException):
 # Container for guild specific state that doesn't need to be saved between runs.
 # A GuildState may be any type, as long as it needs no constructor arguments.
 class GuildStateDB:
-    def __init__(self, bot):
+    def __init__(self, bot: lightbulb.BotApp):
         self.types = {}
         self.statedb = {}
         self.bot = bot
 
     @staticmethod
-    def typekey(state_type):
+    def typekey(state_type: Type[GuildStateBase]) -> str:
         return state_type.__qualname__
 
-    def register_cls(self, state_type):
+    def register_cls(self, state_type: Type[GuildStateBase]) -> None:
         if not issubclass(state_type, GuildStateBase):
             msg = "GuildState type {} must subclass GuildStateBase"
             raise GuildStateException(msg.format(state_type.__name__))
@@ -813,36 +455,37 @@ class GuildStateDB:
         self.types[k] = state_type
         self.statedb[k] = {}
 
-    def unregister_cls(self, state_type):
+    def unregister_cls(self, state_type: Type[GuildStateBase]) -> None:
         k = self.typekey(state_type)
         self.__check_typekey(k)
 
         del self.types[k]
         del self.statedb[k]
 
-    def _get_guild_and_id(self, guild_entity):
+    def _get_guild_and_id(self, guild_entity: Optional[GuildEntity]) -> tuple[hikari.Guild, int]:
         if guild_entity is None:
             raise GuildRequiredException()
 
-        if isinstance(guild_entity, int):
-            return self.bot.get_guild(guild_entity), guild_entity
-
-        if isinstance(guild_entity, discord.Guild):
+        if isinstance(guild_entity, hikari.Guild):
             guild = guild_entity
-        elif hasattr(guild_entity, "guild"):
-            guild = guild_entity.guild
+        elif isinstance(guild_entity, int):
+            guild = self.bot.rest.fetch_guild(guild_entity)
         else:
-            raise TypeError("Guild key must be guild, have a .guild param, or be an integer.")
+            raise TypeError("Guild key must be guild, or be an integer.")
 
         return guild, guild.id
 
-    def __check_typekey(self, k):
+    def __check_typekey(self, k: str) -> None:
         if k not in self.types:
             msg = "GuildState type {} has not been registered."
             raise GuildStateException(msg.format(k))
 
     # Get guild state dict for a given type, and the type itself.
-    def __get_of_type(self, state_type):
+    def __get_of_type(
+        self,
+        state_type: Type[GuildStateBase]
+    ) -> tuple[Type[GuildStateBase], MutableMapping[int, GuildStateBase]]:
+
         k = self.typekey(state_type)
         self.__check_typekey(k)
 
@@ -850,7 +493,7 @@ class GuildStateDB:
 
     # Get a state instance from the DB. If there's no
     # instance for the given guild, one will be created.
-    def get(self, state_type, guild_entity):
+    def get(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity) -> GuildStateBase:
         guild, guild_id = self._get_guild_and_id(guild_entity)
         state_type, guild_states = self.__get_of_type(state_type)
 
@@ -862,14 +505,14 @@ class GuildStateDB:
             return gs
 
     # Clear all state associated with the given guild.
-    def delete(self, guild_entity):
+    def delete(self, guild_entity: GuildEntity) -> None:
         _, guild_id = self._get_guild_and_id(guild_entity)
 
         for states in self.statedb.values():
             if guild_id in states:
-                del guild_id[states]
+                del states[guild_id]
 
     # Iterate over all guild states of a given type
-    def iter_over_type(self, state_type):
+    def iter_over_type(self, state_type: Type[GuildStateBase]) -> Iterator[GuildStateBase]:
         state_type, guild_states = self.__get_of_type(state_type)
         yield from guild_states.values()

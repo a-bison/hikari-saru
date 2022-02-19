@@ -13,6 +13,9 @@ import functools
 import logging
 import time
 
+from collections.abc import Coroutine
+from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any, Callable
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,10 +24,10 @@ logger = logging.getLogger(__name__)
 #########
 
 class CountingIdGenerator:
-    def __init__(self, start_count=0):
+    def __init__(self, start_count: int = 0):
         self.count = start_count
 
-    def next_id(self):
+    def next_id(self) -> int:
         n = self.count
         self.count += 1
 
@@ -35,61 +38,11 @@ class CountingIdGenerator:
 # JOB BASE #
 ############
 
-# Container class for job information. Primary data class for this module.
-class Job:
-    def __init__(self, header, task):
-        self.header = header
-        self.task = task
-        self.complete_event = asyncio.Event()
-
-    # Marks this job as complete, notifies all coroutines waiting on it.
-    def mark_complete(self):
-        self.complete_event.set()
-
-    # Wait for this job to finish.
-    async def wait(self, timeout=None):
-        if timeout is None:
-            await self.complete_event.wait()
-        else:
-            await asyncio.wait_for(self.complete_event.wait(), timeout)
-
-        return self.header.results
-
-
-# Task base class. Subclass this to create your own Tasks.
-class JobTask(ABC):
-    @abstractmethod
-    async def run(self, header):
-        raise NotImplemented("Subclass JobTask to implement specific tasks.")
-
-    # Optional function that returns a default dict of properties to be passed
-    # into run() on job execution. If None is returned, no defaults will be
-    # set. Optionally, the implementation may use the current properties to
-    # select new defaults.
-    @classmethod
-    def property_default(cls, properties):
-        return None
-
-    # Class method that returns the string name of this task type.
-    @classmethod
-    @abstractmethod
-    def task_type(cls):
-        return "NONE"
-
-    # Pretty print info about this task. This should only return information
-    # included in the header.properties dictionary. Higher level information
-    # is the responsibility of the caller.
-    def display(self, header):
-        msg = "display() not implemented for task {}"
-        logger.warning(msg.format(header.task_type))
-
-        return ""
-
 
 # Metadata for tracking a job, for scheduling and persistence purposes.
 class JobHeader:
     @classmethod
-    def from_dict(cls, id, d):
+    def from_dict(cls, id: int, d: Mapping) -> 'JobHeader':
         return JobHeader(
             id,  # ignore loaded id
             d["task_type"],
@@ -100,7 +53,16 @@ class JobHeader:
             d["schedule_id"]
         )
 
-    def __init__(self, id, task_type, properties, owner_id, guild_id, start_time, schedule_id=None):
+    def __init__(
+        self,
+        id,
+        task_type: str,
+        properties: Mapping,
+        owner_id: int,
+        guild_id: int,
+        start_time: int,
+        schedule_id: Optional[int] = None
+    ):
         self.id = id
 
         # Arguments to the job.
@@ -132,7 +94,7 @@ class JobHeader:
         # The results of the job, if any.
         self.results = None
 
-    def as_dict(self):
+    def as_dict(self) -> Mapping:
         return {
             "id": self.id,
             "properties": self.properties,
@@ -142,6 +104,57 @@ class JobHeader:
             "start_time": self.start_time,
             "task_type": self.task_type
         }
+
+
+# Task base class. Subclass this to create your own Tasks.
+class JobTask(ABC):
+    @abstractmethod
+    async def run(self, header: JobHeader) -> None:
+        raise NotImplemented("Subclass JobTask to implement specific tasks.")
+
+    # Optional function that returns a default dict of properties to be passed
+    # into run() on job execution. If None is returned, no defaults will be
+    # set. Optionally, the implementation may use the current properties to
+    # select new defaults.
+    @classmethod
+    def property_default(cls, properties: Mapping) -> Optional[Mapping]:
+        return None
+
+    # Class method that returns the string name of this task type.
+    @classmethod
+    @abstractmethod
+    def task_type(cls) -> str:
+        return "NONE"
+
+    # Pretty print info about this task. This should only return information
+    # included in the header.properties dictionary. Higher level information
+    # is the responsibility of the caller.
+    def display(self, header: JobHeader) -> str:
+        msg = "display() not implemented for task {}"
+        logger.warning(msg.format(header.task_type))
+
+        return ""
+
+
+# Container class for job information. Primary data class for this module.
+class Job:
+    def __init__(self, header: JobHeader, task: JobTask):
+        self.header = header
+        self.task = task
+        self.complete_event = asyncio.Event()
+
+    # Marks this job as complete, notifies all coroutines waiting on it.
+    def mark_complete(self):
+        self.complete_event.set()
+
+    # Wait for this job to finish.
+    async def wait(self, timeout: Optional[float] = None) -> Coroutine[Mapping]:
+        if timeout is None:
+            await self.complete_event.wait()
+        else:
+            await asyncio.wait_for(self.complete_event.wait(), timeout)
+
+        return self.header.results
 
 
 # Base JobFactory functionality.
@@ -203,33 +216,37 @@ class TaskRegistry:
     def __init__(self):
         self.tasks = {}
 
-    def register(self, cls):
+    def register(self, cls: Type[JobTask]) -> None:
         if not hasattr(cls, "task_type"):
             raise TypeError("Task class must have task_type classmethod")
 
         self.tasks[cls.task_type()] = cls
 
-    def get(self, name):
-        if isinstance(name, str):
-            return self.tasks[name]
-        elif isinstance(name, type) and issubclass(name, JobTask):
-            return name
+    def get(self, task: Union[str, Type[JobTask]]) -> Type[JobTask]:
+        if isinstance(task, str):
+            return self.tasks[task]
+        elif isinstance(task, type) and issubclass(task, JobTask):
+            return task
         else:
-            raise TypeError("Object {} has invalid type".format(str(name)))
+            raise TypeError("Object {} has invalid type".format(str(task)))
 
     # Forces a passed tasktype object to be a string. Also serves to validate
     # a task_type string.
-    def force_str(self, tasktype):
+    def force_str(self, tasktype: Union[str, Type[JobTask]]) -> str:
         return self.get(tasktype).task_type()
 
     # Tests if a task type string is in the task registry.
-    def __contains__(self, item):
+    def __contains__(self, item: str) -> bool:
         return item in self.tasks
+
+
+class JobCallback(Protocol):
+    async def __call__(self, header: JobHeader) -> None: ...
 
 
 # A single job queue. Can run one job at a time.
 class JobQueue:
-    def __init__(self, eventloop=None):
+    def __init__(self, eventloop: asyncio.AbstractEventLoop = None):
         if eventloop is None:
             self.loop = asyncio.get_event_loop()
         else:
@@ -248,26 +265,26 @@ class JobQueue:
         self.job_stop_callback = None
         self.job_cancel_callback = None
 
-    async def submit_job(self, job):
+    async def submit_job(self, job: Job) -> None:
         if self.job_submit_callback is not None:
             await self.job_submit_callback(job.header)
 
         await self.job_queue.put(job)
         self.jobs[job.header.id] = job
 
-    def on_job_submit(self, callback):
+    def on_job_submit(self, callback: JobCallback) -> None:
         self.job_submit_callback = callback
 
-    def on_job_start(self, callback):
+    def on_job_start(self, callback: JobCallback) -> None:
         self.job_start_callback = callback
 
-    def on_job_stop(self, callback):
+    def on_job_stop(self, callback: JobCallback) -> None:
         self.job_stop_callback = callback
 
-    def on_job_cancel(self, callback):
+    def on_job_cancel(self, callback: JobCallback) -> None:
         self.job_cancel_callback = callback
 
-    def _rm_job(self, job):
+    def _rm_job(self, job: Optional[Job]) -> None:
         if job is None:
             return
 
@@ -277,18 +294,18 @@ class JobQueue:
         self.active_job = None
         self.active_task = None
 
-    async def run(self):
+    async def run(self) -> None:
         logger.info("Starting job queue...")
 
         try:
             while True:
                 await self.mainloop()
-        except:
+        except Exception:
             logger.exception("Job queue stopped unexpectedly!")
         finally:
             logger.info("Job queue stoppped.")
 
-    async def mainloop(self):
+    async def mainloop(self) -> None:
         j = await self.job_queue.get()
 
         if j.header.cancel:
@@ -323,7 +340,7 @@ class JobQueue:
         if self.job_stop_callback:
             await self.job_stop_callback(j.header)
 
-    async def canceljob(self, job):
+    async def canceljob(self, job: Union[Job, int]) -> None:
         if isinstance(job, Job):
             job = job.header.id
 
@@ -377,10 +394,18 @@ SCHED_MACROS = {
 # Main scheduling data class.
 class CronHeader:
     @classmethod
-    def from_dict(cls, d):
+    def from_dict(cls, d: Mapping) -> 'CronHeader':
         return CronHeader(**d)
 
-    def __init__(self, id, task_type, properties, owner_id, guild_id, schedule):
+    def __init__(
+        self,
+        id: int,
+        task_type: str,
+        properties: Mapping,
+        owner_id: int,
+        guild_id: int,
+        schedule: str
+    ):
         # ID of this schedule. NOTE: Unlike Jobs, whose ID count resets after
         # every startup, schedules always have the same IDs.
         self.id = id
@@ -418,7 +443,7 @@ class CronHeader:
         # will run. Used by a schedule dispatcher to avoid missing a job fire.
         self.next = None
 
-    def as_dict(self):
+    def as_dict(self) -> Mapping[str, Union[str, int, Mapping]]:
         return {
             "id": self.id,
             "properties": self.properties,
@@ -428,7 +453,7 @@ class CronHeader:
             "schedule": self.schedule
         }
 
-    def as_jobheader(self, id, start_time):
+    def as_jobheader(self, id: int, start_time: int) -> JobHeader:
         return JobHeader(
             id,
             self.task_type,
@@ -441,14 +466,14 @@ class CronHeader:
 
     # Updates self.next to the next run after current datetime. Used by the
     # schedule dispatcher.
-    def update_next(self):
+    def update_next(self) -> None:
         sched_obj = cron_parse(self.schedule)
 
         # Make sure to avoid multiple schedule firings, so make carry=1.
         # See cron_next_date() for more details.
         self.next = cron_next_date_as_datetime(sched_obj, carry=1)
 
-    def match(self, **kwargs):
+    def match(self, **kwargs: Union[str, int, Mapping]) -> bool:
         d = self.as_dict()
 
         for key, value in kwargs.items():
@@ -464,15 +489,16 @@ class CronHeader:
 
 
 class ScheduleParseException(Exception):
-    def __init__(self, *args, cronstr=None):
+    def __init__(self, *args: Any, cronstr: str = None):
         super().__init__(*args)
 
         self.cronstr = cronstr
 
 
+# TODO: Fix typing here, needs to be more specific.
 # Parse a schedule string into a dictionary.
 @functools.cache
-def cron_parse(schedule_str):
+def cron_parse(schedule_str: str) -> Mapping:
     schedule_str = schedule_str.lower()
 
     # Parse macros first
@@ -521,16 +547,16 @@ def cron_parse(schedule_str):
 
 # Conversion functions for weekday formats. The python datetime library
 # starts counting weekdays at Mon=0, but cron strings start at Sun=0.
-def wd_cron_to_python(wd):
+def wd_cron_to_python(wd: int) -> int:
     return (wd + 6) % 7
 
 
-def wd_python_to_cron(wd):
+def wd_python_to_cron(wd: int) -> int:
     return (wd + 1) % 7
 
 
 # Test whether a schedule should run, based on a timedate object.
-def cron_match(schedule_str, timedate_obj):
+def cron_match(schedule_str: str, timedate_obj: datetime) -> bool:
     sd = cron_parse(schedule_str)
 
     for name, elem in sd.items():
@@ -738,7 +764,7 @@ def _next_elem(elem_name, elem, carry, t, schedule):
 # Calculate all of a given weekday in a given month. Returns
 # a list of day numbers within the given month.
 @functools.cache
-def cron_calc_days(year, month, wd):
+def cron_calc_days(year: int, month: int, wd: int) -> Sequence[int]:
     # Calendar starts at 0 = Monday, goes to 6 = Sunday. Cron format is offset
     # from that, so we need to convert to python range.
     wd = wd_cron_to_python(wd)
@@ -748,7 +774,7 @@ def cron_calc_days(year, month, wd):
 
 
 # Convert the output of cron_next_date to a datetime object.
-def cron_next_to_datetime(cron_next):
+def cron_next_to_datetime(cron_next: Mapping) -> datetime:
     return datetime(
         cron_next["year"],
         cron_next["month"],
@@ -763,10 +789,14 @@ def cron_next_date_as_datetime(schedule, from_date=None, carry=0):
     return cron_next_to_datetime(cron_next_date(schedule, from_date, carry))
 
 
+class ScheduleCallback(Protocol):
+    def __call__(self, sheader: CronHeader) -> Coroutine[None]: ...
+
+
 # A scheduler that starts jobs at specific real-world dates.
 # Expected to have minute-level accuracy.
 class JobCron:
-    def __init__(self, jobqueue, jobfactory):
+    def __init__(self, jobqueue: JobQueue, jobfactory: JobFactory):
         self.jobqueue = jobqueue
         self.jobfactory = jobfactory
 
@@ -776,14 +806,14 @@ class JobCron:
         self.sched_create_callback = None
         self.sched_delete_callback = None
 
-    def on_create_schedule(self, callback):
+    def on_create_schedule(self, callback: ScheduleCallback) -> None:
         self.sched_create_callback = callback
 
-    def on_delete_schedule(self, callback):
+    def on_delete_schedule(self, callback: ScheduleCallback) -> None:
         self.sched_delete_callback = callback
 
     # Stop a schedule from running.
-    async def delete_schedule(self, id):
+    async def delete_schedule(self, id: int) -> None:
         async with self.schedule_lock:
             sheader = self.schedule[id]
             sheader.next = None
@@ -794,7 +824,7 @@ class JobCron:
             del self.schedule[id]
 
     # Replace a schedule entry with a new one.
-    async def replace_schedule(self, id, sheader):
+    async def replace_schedule(self, id: int, sheader: CronHeader) -> None:
         async with self.schedule_lock:
             old_hdr = self.schedule[id]
 
@@ -813,7 +843,7 @@ class JobCron:
             self.schedule[id] = new_hdr
 
     # Schedule a job.
-    async def create_schedule(self, sheader):
+    async def create_schedule(self, sheader: CronHeader) -> None:
         async with self.schedule_lock:
             # Calculate the next run date right away. This also
             # functions to validate the cron str before scheduling.
@@ -825,7 +855,7 @@ class JobCron:
 
             self.schedule[sheader.id] = sheader
 
-    async def run(self):
+    async def run(self) -> None:
         # The background task that starts jobs. Checks if there are new jobs
         # to start roughly once every minute.
         logger.info("Starting job scheduler...")
@@ -842,7 +872,7 @@ class JobCron:
             logger.exception("Scheduler stopped unexpectedly!")
 
     # Single iteration of schedule dispatch.
-    async def mainloop(self):
+    async def mainloop(self) -> None:
         for id, sheader in self.schedule.items():
             # If we've gone past the scheduled time, fire the job,
             # regenerate the next time using the cron string.
@@ -850,7 +880,7 @@ class JobCron:
                 sheader.update_next()
                 await self._start_scheduled_job(sheader)
 
-    async def _start_scheduled_job(self, cron_header):
+    async def _start_scheduled_job(self, cron_header: CronHeader) -> Job:
         job = await self.jobfactory.create_job_from_cron(cron_header)
         msg = "SCHED {}: Firing job type={} {}"
         logger.info(msg.format(
@@ -861,21 +891,21 @@ class JobCron:
         return job
 
     # Run a scheduled job immediately, returning the resulting job.
-    async def run_now(self, id):
+    async def run_now(self, id: int) -> Job:
         hdr = self.schedule[id]
         return await self._start_scheduled_job(hdr)
 
     # Returns a copy of the schedule, filtered by the given parameters.
-    def sched_filter(self, **kwargs):
+    def sched_filter(self, **kwargs: Union[int, str, Mapping]) -> Mapping[int, CronHeader]:
         return {id: c for id, c in self.schedule.items()
                 if c.match(**kwargs)}
 
     # Returns a copy of the schedule.
-    def sched_copy(self):
+    def sched_copy(self) -> Mapping[int, CronHeader]:
         return dict(self.schedule)
 
     # Reschedule a schedule entry.
-    async def reschedule(self, id, cronstr):
+    async def reschedule(self, id: int, cronstr: str) -> None:
         hdr = self.schedule[id]
         
         new_hdr = copy.deepcopy(hdr)
@@ -898,16 +928,16 @@ class BlockerTask(JobTask):
         pass
 
     @classmethod
-    def task_type(cls):
+    def task_type(cls) -> str:
         return "blocker"
 
     @classmethod
-    def property_default(cls, properties):
+    def property_default(cls, properties: Mapping) -> Mapping:
         return {
             "time": 60  # seconds. if None, loops forever.
         }
 
-    async def run(self, header):
+    async def run(self, header: JobHeader) -> None:
         p = header.properties
         time = p["time"]
 
@@ -921,5 +951,5 @@ class BlockerTask(JobTask):
                 await asyncio.sleep(1)
                 counter -= 1
 
-    def display(self, header):
+    def display(self, header: JobHeader) -> str:
         return ""

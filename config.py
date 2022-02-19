@@ -4,110 +4,55 @@
 
 import logging
 import json
+import pathlib
 from datetime import datetime
+
+from collections.abc import Mapping, MutableMapping
+from typing import Optional, Union, Protocol, Sequence, Callable
 
 logger = logging.getLogger(__name__)
 
 
-# Very simple config database consisting of json files on disk.
-# Saves a different version of the config depending on the ID.
-#
-# On disk structure:
-# config_root_dir \_ common.json
-#                 |_ <id_1>.json
-#                 |_ <id_2>.json
-#
-class JsonConfigDB:
-    def __init__(self, path, template=None, unique_template=False):
-        self.path = path
-        self.db = {}
-        self.template = template
-        self.unique_template = unique_template
-
-        if path.is_dir():
-            self.load_db()
-        elif path.exists():
-            msg = "config {} is not a directory"
-            raise FileExistsError(msg.format(str(path)))
-        else:  # No file or dir, so create new
-            self.create_new_db()
-        
-    # Creates a new config DB
-    def create_new_db(self):
-        try:
-            self.path.mkdir()
-        except FileNotFoundError:
-            logger.error("Parent directories of config not found.")
-            raise
-
-    def cfg_loc(self, cid):
-        return self.path / (str(cid) + ".json")
-
-    def get_template(self, cid):
-        if self.unique_template:
-            cid = str(cid)
-
-            if cid in self.template:
-                return self.template[cid]
-            else:
-                return {}
-        else:
-            return self.template
-
-    # Loads the entire DB from a directory on disk.
-    # Note that this will override any configuration currently loaded in
-    # memory.
-    def load_db(self):
-        self.db = {}
-
-        for child in self.path.iterdir():
-            try:
-                cid = child.stem
-            except ValueError:
-                continue
-
-            template = self.get_template(cid)
-            self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
-            logger.info("Load config: id {}".format(cid))
-
-    def write_db(self):
-        for cfg in self.db.values():
-            cfg.write()
-
-    # Gets the config for a single guild. If the config for a guild doesn't
-    # exist, create it.
-    def get_config(self, cid):
-        cid = str(cid)
-
-        if cid not in self.db:
-            self.create_config(cid)
-
-        return self.db[cid]
-
-    def create_config(self, cid):
-        cid = str(cid)
-        template = self.get_template(cid)
-
-        self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
+ConfigValue = Union[
+    str,
+    int,
+    bool,
+    float,
+    Sequence['ConfigValue'],
+    MutableMapping[str, 'ConfigValue']
+]
 
 
-# Mixin for configuration. Expects the following:
-# - write() function that writes the configuration.
-# - clear() function that clears the configuration.
-# - a property called "opts" that allows dictionary operations.
+class ConfigBaseProtocol(Protocol):
+    # noinspection PyPropertyDefinition
+    @property
+    def opts(self) -> MutableMapping[str, ConfigValue]: ...
+
+    @opts.setter
+    def opts(self, opts: MutableMapping[str, ConfigValue]) -> None: ...
+
+    def write(self) -> None: ...
+    def clear(self) -> None: ...
+
+
+# Mixin for basic configuration functions. Subclasses must implement ConfigBaseProtocol.
 class ConfigMixin:
-    def set(self, key, value):
+    def set(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
         self.opts[key] = value
         self.write()
 
-    def get(self, key):
+    def get(self: ConfigBaseProtocol, key: str) -> ConfigValue:
         return self.opts[key]
 
-    def get_and_set(self, key, f):
+    def get_and_set(
+        self: ConfigBaseProtocol,
+        key: str,
+        f: Callable[[ConfigValue], ConfigValue]
+    ) -> None:
         self.opts[key] = f(self.opts[key])
         self.write()
 
-    def delete(self, key, ignore_keyerror=False):
+    def delete(self: ConfigBaseProtocol, key: str, ignore_keyerror: bool = False) -> None:
         if ignore_keyerror and key not in self.opts:
             return
 
@@ -115,25 +60,30 @@ class ConfigMixin:
         self.write()
 
     # Clears an entire config, and returns a copy of what was just cleared.
-    def get_and_clear(self):
+    def get_and_clear(self: ConfigBaseProtocol) -> MutableMapping[str, ConfigValue]:
         cfg = dict(self.opts)
         self.clear()
         self.write()
 
         return cfg
 
-    def __contains__(self, item):
+    def __contains__(self: ConfigBaseProtocol, item: str) -> ConfigValue:
         return item in self.opts
 
 
-# Enable a config to get subconfigs.
+# Enable a config to get sub-configs.
 class SubconfigMixin:
-    def sub(self, key):
+    def sub(self: ConfigBaseProtocol, key: str) -> 'SubConfig':
         return SubConfig(self, key, self.opts[key])
 
 
 class SubConfig(ConfigMixin, SubconfigMixin):
-    def __init__(self, parent, name, cfg):
+    def __init__(
+        self: ConfigBaseProtocol,
+        parent: ConfigBaseProtocol,
+        name: str,
+        cfg: MutableMapping[str, ConfigValue]
+    ):
         super().__init__()
 
         self.parent = parent
@@ -144,11 +94,11 @@ class SubConfig(ConfigMixin, SubconfigMixin):
 
     # On clear, we create a new dict in the parent and set our reference
     # to the new storage.
-    def clear(self):
+    def clear(self) -> None:
         self.parent.opts[self.name] = {}
         self.opts = self.parent.opts[self.name]
 
-    def write(self):
+    def write(self) -> None:
         self.parent.write()
 
 
@@ -164,7 +114,12 @@ class ConfigException(Exception):
 # raise an exception. Use this if you intend to edit the config manually,
 # and want to make sure your modifications aren't overwritten.
 class JsonConfig(ConfigMixin, SubconfigMixin):
-    def __init__(self, path, template=None, check_date=False):
+    def __init__(
+        self,
+        path: pathlib.Path,
+        template: Mapping = None,
+        check_date: bool = False
+    ):
         super().__init__()
 
         self.opts = {}
@@ -174,16 +129,16 @@ class JsonConfig(ConfigMixin, SubconfigMixin):
         self.last_readwrite_date = None
         self.init()
 
-    def init(self):
+    def init(self) -> None:
         if self.path.exists():
             self.load()
         else:
             self.create()
 
-    def __update_last_date(self):
+    def __update_last_date(self) -> None:
         self.last_readwrite_date = datetime.now().timestamp()
 
-    def load(self):
+    def load(self) -> None:
         template = self.template
 
         with open(self.path, 'r') as f:
@@ -207,16 +162,16 @@ class JsonConfig(ConfigMixin, SubconfigMixin):
             if template_additions:
                 self.write()
 
-    def create(self):
+    def create(self) -> None:
         if self.template is not None:
             self.opts = dict(self.template)
 
         self.write()
 
-    def clear(self):
+    def clear(self) -> None:
         self.opts = {}
 
-    def write(self):
+    def write(self) -> None:
         if self.path.exists() and self.check_date:
             file_timestamp = self.path.stat().st_mtime
 
@@ -230,3 +185,90 @@ class JsonConfig(ConfigMixin, SubconfigMixin):
             json.dump(self.opts, f, indent=4)
 
         self.__update_last_date()
+
+
+# Very simple config database consisting of json files on disk.
+# Saves a different version of the config depending on the ID.
+#
+# On disk structure:
+# config_root_dir \_ common.json
+#                 |_ <id_1>.json
+#                 |_ <id_2>.json
+#
+class JsonConfigDB:
+    def __init__(
+            self,
+            path: pathlib.Path,
+            template: Optional[Mapping] = None,
+            unique_template: bool = False
+    ):
+        self.path = path
+        self.db = {}
+        self.template = template
+        self.unique_template = unique_template
+
+        if path.is_dir():
+            self.load_db()
+        elif path.exists():
+            msg = "config {} is not a directory"
+            raise FileExistsError(msg.format(str(path)))
+        else:  # No file or dir, so create new
+            self.create_new_db()
+
+    # Creates a new config DB
+    def create_new_db(self) -> None:
+        try:
+            self.path.mkdir()
+        except FileNotFoundError:
+            logger.error("Parent directories of config not found.")
+            raise
+
+    def cfg_loc(self, cid: Union[int, str]) -> pathlib.Path:
+        return self.path / (str(cid) + ".json")
+
+    def get_template(self, cid: Union[int, str]) -> Mapping:
+        if self.unique_template:
+            cid = str(cid)
+
+            if cid in self.template:
+                return self.template[cid]
+            else:
+                return {}
+        else:
+            return self.template
+
+    # Loads the entire DB from a directory on disk.
+    # Note that this will override any configuration currently loaded in
+    # memory.
+    def load_db(self) -> None:
+        self.db = {}
+
+        for child in self.path.iterdir():
+            try:
+                cid = child.stem
+            except ValueError:
+                continue
+
+            template = self.get_template(cid)
+            self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
+            logger.info("Load config: id {}".format(cid))
+
+    def write_db(self) -> None:
+        for cfg in self.db.values():
+            cfg.write()
+
+    # Gets the config for a single guild. If the config for a guild doesn't
+    # exist, create it.
+    def get_config(self, cid: Union[int, str]) -> JsonConfig:
+        cid = str(cid)
+
+        if cid not in self.db:
+            self.create_config(cid)
+
+        return self.db[cid]
+
+    def create_config(self, cid: Union[int, str]) -> None:
+        cid = str(cid)
+        template = self.get_template(cid)
+
+        self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
