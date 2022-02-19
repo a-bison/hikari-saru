@@ -7,8 +7,8 @@ import json
 import pathlib
 from datetime import datetime
 
-from collections.abc import Mapping, MutableMapping
-from typing import Optional, Union, Protocol, Sequence, Callable
+from collections.abc import Mapping, MutableMapping, MutableSequence
+from typing import Optional, Union, Protocol, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -18,21 +18,25 @@ ConfigValue = Union[
     int,
     bool,
     float,
-    Sequence['ConfigValue'],
+    MutableSequence['ConfigValue'],
     MutableMapping[str, 'ConfigValue']
 ]
 
 
 class ConfigBaseProtocol(Protocol):
-    # noinspection PyPropertyDefinition
-    @property
-    def opts(self) -> MutableMapping[str, ConfigValue]: ...
-
-    @opts.setter
-    def opts(self, opts: MutableMapping[str, ConfigValue]) -> None: ...
+    opts: MutableMapping[str, ConfigValue]
 
     def write(self) -> None: ...
     def clear(self) -> None: ...
+
+
+class ConfigProtocol(ConfigBaseProtocol):
+    def set(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None: ...
+    def get(self: ConfigBaseProtocol, key: str) -> ConfigValue: ...
+    def get_and_set(self: ConfigBaseProtocol, key: str, f: Callable[[ConfigValue], ConfigValue]) -> None: ...
+    def delete(self: ConfigBaseProtocol, key: str, ignore_keyerror: bool = False) -> None: ...
+    def get_and_clear(self: ConfigBaseProtocol) -> MutableMapping[str, ConfigValue]: ...
+    def __contains__(self: ConfigBaseProtocol, item: str) -> ConfigValue: ...
 
 
 # Mixin for basic configuration functions. Subclasses must implement ConfigBaseProtocol.

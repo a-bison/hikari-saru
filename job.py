@@ -13,8 +13,8 @@ import functools
 import logging
 import time
 
-from collections.abc import Coroutine
-from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any, Callable
+from collections.abc import Coroutine, MutableMapping
+from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class JobHeader:
         # The results of the job, if any.
         self.results = None
 
-    def as_dict(self) -> Mapping:
+    def as_dict(self) -> MutableMapping[str, Any]:
         return {
             "id": self.id,
             "properties": self.properties,
@@ -443,7 +443,7 @@ class CronHeader:
         # will run. Used by a schedule dispatcher to avoid missing a job fire.
         self.next = None
 
-    def as_dict(self) -> Mapping[str, Union[str, int, Mapping]]:
+    def as_dict(self) -> MutableMapping[str, Any]:
         return {
             "id": self.id,
             "properties": self.properties,
