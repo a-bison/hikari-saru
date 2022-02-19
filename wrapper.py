@@ -181,7 +181,8 @@ class Saru:
 
     async def join_guilds_offline(self):
         """Create config entries for any guilds that were joined while offline."""
-        async for guild in self.bot.rest.fetch_my_guilds(newest_first=True):
+        # TODO Investigate bug in fetch_my_guilds: newest_first appears to repeat guilds?
+        async for guild in self.bot.rest.fetch_my_guilds():
             logger.info("In guilds: {}({})".format(guild.name, guild.id))
             _ = self.config_db.get_config(guild.id)
             _ = self.job_db.get_config(guild.id)
