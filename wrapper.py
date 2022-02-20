@@ -3,6 +3,7 @@ import os
 import pathlib
 import logging
 import time
+from types import MappingProxyType
 from typing import Optional, Union, Type, Any, TypeVar
 
 import hikari
@@ -18,29 +19,6 @@ logger = logging.getLogger(__name__)
 
 GuildEntity = Union[int, hikari.Guild]
 T = TypeVar('T')
-
-
-class GuildStateBase:
-    @classmethod
-    async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
-        """Shortcut function for getting a GuildState instance from ctx"""
-        db = await ctx.bot.d.saru.gs(cls, ctx.guild_id)
-        return db
-
-    @classmethod
-    def register(cls, bot: lightbulb.BotApp):
-        """Shortcut function for registering a GuildState class to Saru."""
-        bot.d.saru.gstype(cls)
-
-    @classmethod
-    def unregister(cls, bot: lightbulb.BotApp):
-        """Shortcut function for unregistering a GuildState class from Saru"""
-        gs_db: GuildStateDB = bot.d.saru.gs_db
-        gs_db.unregister_cls(cls)
-
-    def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
-        self.bot = bot
-        self.guild = guild
 
 
 # Attach a new instance of Saru to a BotApp.
@@ -64,8 +42,8 @@ class Saru:
         self,
         bot: lightbulb.BotApp,
         config_path: pathlib.Path,
-        cfgtemplate: Mapping = {},
-        common_cfgtemplate: Mapping = {}
+        cfgtemplate: Mapping = MappingProxyType({}),
+        common_cfgtemplate: Mapping = MappingProxyType({})
     ):
         self.bot = bot
         self.loop = asyncio.get_event_loop()
@@ -272,7 +250,7 @@ class Saru:
         self.task_registry.register(tsk)
 
     # Register a guild state class.
-    def gstype(self, state_type: Type[GuildStateBase]) -> None:
+    def gstype(self, state_type: Type['GuildStateBase']) -> None:
         self.gs_db.register_cls(state_type)
 
     # Shortcut to get the config for a given command.
@@ -291,7 +269,7 @@ class Saru:
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
     # guild property.
-    async def gs(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity):
+    async def gs(self, state_type: Type['GuildStateBase'], guild_entity: GuildEntity):
         return await self.gs_db.get(state_type, guild_entity)
 
 
@@ -442,6 +420,33 @@ class MessageTask(job.JobTask):
         return fmt.format(msg, p["post_interval"], p["post_number"])
 
 
+################
+# GUILD STATES #
+################
+
+class GuildStateBase:
+    @classmethod
+    async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
+        """Shortcut function for getting a GuildState instance from ctx"""
+        db = await ctx.bot.d.saru.gs(cls, ctx.guild_id)
+        return db
+
+    @classmethod
+    def register(cls, bot: lightbulb.BotApp):
+        """Shortcut function for registering a GuildState class to Saru."""
+        bot.d.saru.gstype(cls)
+
+    @classmethod
+    def unregister(cls, bot: lightbulb.BotApp):
+        """Shortcut function for unregistering a GuildState class from Saru"""
+        gs_db: GuildStateDB = bot.d.saru.gs_db
+        gs_db.unregister_cls(cls)
+
+    def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
+        self.bot = bot
+        self.guild = guild
+
+
 class GuildStateException(Exception):
     pass
 
@@ -451,7 +456,6 @@ class GuildRequiredException(GuildStateException):
 
 
 # Container for guild specific state that doesn't need to be saved between runs.
-# A GuildState may be any type, as long as it needs no constructor arguments.
 class GuildStateDB:
     def __init__(self, bot: lightbulb.BotApp):
         self.types = {}
