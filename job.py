@@ -108,6 +108,8 @@ class JobHeader:
 
 # Task base class. Subclass this to create your own Tasks.
 class JobTask(ABC):
+    def __init__(self, *_, **__): ...
+
     @abstractmethod
     async def run(self, header: JobHeader) -> None:
         raise NotImplemented("Subclass JobTask to implement specific tasks.")
@@ -157,9 +159,49 @@ class Job:
         return self.header.results
 
 
+# Simple registry for getting task types.
+class TaskRegistry:
+    def __init__(self):
+        self.tasks = {}
+
+    def register(self, cls: Type[JobTask]) -> None:
+        if not hasattr(cls, "task_type"):
+            raise TypeError("Task class must have task_type classmethod")
+
+        self.tasks[cls.task_type()] = cls
+
+    def unregister(self, cls: Type[JobTask]) -> None:
+        if not hasattr(cls, "task_type"):
+            raise TypeError("Task class must have task_type classmethod")
+
+        tt = cls.task_type()
+
+        if tt not in self.tasks:
+            logger.warning(f"Task {tt} not in task registry. Not unregistering.")
+        else:
+            del self.tasks[tt]
+
+    def get(self, task: Union[str, Type[JobTask]]) -> Type[JobTask]:
+        if isinstance(task, str):
+            return self.tasks[task]
+        elif isinstance(task, type) and issubclass(task, JobTask):
+            return task
+        else:
+            raise TypeError("Object {} has invalid type".format(str(task)))
+
+    # Forces a passed tasktype object to be a string. Also serves to validate
+    # a task_type string.
+    def force_str(self, tasktype: Union[str, Type[JobTask]]) -> str:
+        return self.get(tasktype).task_type()
+
+    # Tests if a task type string is in the task registry.
+    def __contains__(self, item: str) -> bool:
+        return item in self.tasks
+
+
 # Base JobFactory functionality.
 class JobFactory(ABC):
-    def __init__(self, task_registry):
+    def __init__(self, task_registry: TaskRegistry):
         self.id_counter = CountingIdGenerator()
         self.task_registry = task_registry
 
@@ -209,35 +251,6 @@ class JobFactory(ABC):
     @abstractmethod
     async def create_task(self, header):
         pass
-
-
-# Simple registry for getting task types.
-class TaskRegistry:
-    def __init__(self):
-        self.tasks = {}
-
-    def register(self, cls: Type[JobTask]) -> None:
-        if not hasattr(cls, "task_type"):
-            raise TypeError("Task class must have task_type classmethod")
-
-        self.tasks[cls.task_type()] = cls
-
-    def get(self, task: Union[str, Type[JobTask]]) -> Type[JobTask]:
-        if isinstance(task, str):
-            return self.tasks[task]
-        elif isinstance(task, type) and issubclass(task, JobTask):
-            return task
-        else:
-            raise TypeError("Object {} has invalid type".format(str(task)))
-
-    # Forces a passed tasktype object to be a string. Also serves to validate
-    # a task_type string.
-    def force_str(self, tasktype: Union[str, Type[JobTask]]) -> str:
-        return self.get(tasktype).task_type()
-
-    # Tests if a task type string is in the task registry.
-    def __contains__(self, item: str) -> bool:
-        return item in self.tasks
 
 
 class JobCallback(Protocol):
@@ -925,7 +938,7 @@ class BlockerTask(JobTask):
     # Ignore any arguments passed in to retain compatibility with all job
     # factories.
     def __init__(self, *args, **kwargs):
-        pass
+        super().__init__()
 
     @classmethod
     def task_type(cls) -> str:

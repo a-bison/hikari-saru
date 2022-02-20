@@ -239,7 +239,7 @@ class Saru:
     async def start_job(
         self,
         ctx: lightbulb.Context,
-        task_type: str,
+        task_type: Union[str, Type[job.JobTask]],
         properties: Mapping
     ) -> job.Job:
 
@@ -318,7 +318,6 @@ class DiscordJobFactory(job.JobFactory):
         task_type: str,
         schedule_id: Optional[int]
     ) -> job.JobHeader:
-
         header = job.JobHeader(
             self.next_id(),
             task_type,
@@ -335,7 +334,7 @@ class DiscordJobFactory(job.JobFactory):
     async def create_job(
         self,
         ctx: lightbulb.Context,
-        task_type: str,
+        task_type: Union[str, Type[job.JobTask]],
         properties: Mapping,
         schedule_id: Optional[int] = None
     ) -> job.Job:
@@ -405,6 +404,8 @@ class MessageTask(job.JobTask):
     MAX_MSG_DISPLAY_LEN = 15
 
     def __init__(self, bot, guild):
+        super().__init__()
+
         self.bot = bot
         self.guild = guild
 
