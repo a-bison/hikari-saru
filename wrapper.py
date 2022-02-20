@@ -3,7 +3,7 @@ import os
 import pathlib
 import logging
 import time
-from typing import Optional, Union, Type, Any
+from typing import Optional, Union, Type, Any, TypeVar
 
 import hikari
 import lightbulb
@@ -17,9 +17,27 @@ logger = logging.getLogger(__name__)
 
 
 GuildEntity = Union[int, hikari.Guild]
+T = TypeVar('T')
 
 
 class GuildStateBase:
+    @classmethod
+    async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
+        """Shortcut function for getting a GuildState instance from ctx"""
+        db = await ctx.bot.d.saru.gs(cls, ctx.guild_id)
+        return db
+
+    @classmethod
+    def register(cls, bot: lightbulb.BotApp):
+        """Shortcut function for registering a GuildState class to Saru."""
+        bot.d.saru.gstype(cls)
+
+    @classmethod
+    def unregister(cls, bot: lightbulb.BotApp):
+        """Shortcut function for unregistering a GuildState class from Saru"""
+        gs_db: GuildStateDB = bot.d.saru.gs_db
+        gs_db.unregister_cls(cls)
+
     def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
         self.bot = bot
         self.guild = guild
