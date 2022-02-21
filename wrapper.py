@@ -4,15 +4,16 @@ import pathlib
 import logging
 import time
 from types import MappingProxyType
-from typing import Optional, Union, Type, Any, TypeVar
+from typing import Optional, Union, Type, Any, TypeVar, Protocol
 
 import hikari
 import lightbulb
 
 from . import job
 from . import config
+from .util import ack
 
-from collections.abc import Mapping, MutableMapping, Iterator
+from collections.abc import Mapping, MutableMapping, Iterator, Coroutine
 
 logger = logging.getLogger(__name__)
 
@@ -540,3 +541,85 @@ class GuildStateDB:
     def iter_over_type(self, state_type: Type[GuildStateBase]) -> Iterator[GuildStateBase]:
         state_type, guild_states = self.__get_of_type(state_type)
         yield from guild_states.values()
+
+
+#####################
+# COMMAND UTILITIES #
+#####################
+
+
+class ConfigCallbackProtocol(Protocol):
+    def __call__(
+        self,
+        ctx: lightbulb.Context,
+        cfg: config.ConfigProtocol,
+        key: str,
+        value: config.ConfigValue
+    ) -> Coroutine[None]: ...
+
+
+def config_command(
+    implements: Type[lightbulb.Command] = lightbulb.PrefixCommand,
+    type: Optional[Type] = str,
+    config_key: Optional[str] = None,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    require_admin: bool = True,
+    **command_kwargs: Any
+):
+    """
+    Generates a new configuration command.
+    """
+    def deco(coro: ConfigCallbackProtocol) -> lightbulb.CommandLike:
+        nonlocal config_key
+
+        config_key = coro.__name__ if not config_key else config_key
+        command_name = config_key.replace("_", "-") if not name else name
+        command_desc = (
+            f"Get/set {config_key.replace('_', ' ').lower()}"
+            if not description else description
+        )
+
+        @lightbulb.option(
+            "value",
+            "The value to set.",
+            type=type,
+            default=None
+        )
+        @lightbulb.command(
+            command_name,
+            command_desc,
+            **command_kwargs
+        )
+        @lightbulb.implements(implements)
+        async def _(ctx: lightbulb.Context) -> None:
+            cfg: config.ConfigProtocol = ctx.bot.d.saru.cfg(ctx.guild_id)
+            value = ctx.options.value
+
+            # GET
+            if value is None:
+                display_name = config_key.replace("_", " ").capitalize()
+                value = cfg.get(config_key)
+                await ctx.respond(f"{display_name} is {value}.")
+                return
+
+            # SET
+            if require_admin:
+                perms = lightbulb.utils.permissions_for(
+                    ctx.event.message.member
+                )
+
+                if perms == hikari.Permissions.NONE:
+                    await ctx.respond("Internal error: cache not available")
+                    return
+                elif not perms & hikari.Permissions.ADMINISTRATOR:
+                    await ctx.respond("You must be administrator to set this value.")
+                    return
+
+            await coro(ctx, cfg, config_key, value)
+            cfg.set(config_key, value)
+            await ack(ctx)
+
+        return _
+
+    return deco
