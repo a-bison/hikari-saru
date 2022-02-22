@@ -9,6 +9,7 @@ from typing import Optional, Union, Type, Any, TypeVar, Protocol
 import hikari
 import lightbulb
 
+import saru
 from . import job
 from . import config
 from .util import ack
@@ -426,6 +427,8 @@ class MessageTask(job.JobTask):
 ################
 
 class GuildStateBase:
+    _cfg_key = None
+
     @classmethod
     async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
         """Shortcut function for getting a GuildState instance from ctx"""
@@ -446,6 +449,44 @@ class GuildStateBase:
     def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
         self.bot = bot
         self.guild = guild
+        self.__cfg = None
+
+        cfg_key = type(self)._cfg_key
+        if type(self)._cfg_key is not None:
+            top_cfg = bot.d.saru.cfg(guild.id)
+
+            if cfg_key not in top_cfg:
+                top_cfg.set(cfg_key, {})
+
+            self.__cfg = top_cfg.get(cfg_key)
+
+    @property
+    def cfg(self) -> Optional[config.ConfigProtocol]:
+        """Get the config backing this guild state.
+
+        Will be None unless the @config_backed decorator is used.
+        """
+        return self.__cfg
+
+
+def config_backed(config_key: str):
+    """Second order decorator that sets up a backing config for a
+    GuildState type.
+    """
+    def deco(gs_type: Type[GuildStateBase]) -> Type[GuildStateBase]:
+        gs_type._cfg_key = config_key
+        return gs_type
+
+    return deco
+
+
+def register(bot: lightbulb.BotApp):
+    """Second order decorator that calls .register(bot) on the decorated
+    type.
+    """
+    def deco(gs_type: Type[GuildStateBase]) -> Type[GuildStateBase]:
+        gs_type.register(bot)
+        return gs_type
 
 
 class GuildStateException(Exception):
