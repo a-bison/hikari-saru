@@ -76,5 +76,5 @@ TODO
 
 # Additional Notes
 
-This library was orignally called [monkycord](https://github.com/a-bison/monkycord). Due to discord.py getting
+This library was originally called [monkycord](https://github.com/a-bison/monkycord). Due to discord.py getting
 discontinued, and because I wanted to learn something new, I migrated this toolkit to [hikari](https://github.com/hikari-py/hikari).
