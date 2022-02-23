@@ -450,6 +450,7 @@ class GuildStateBase:
         self.bot = bot
         self.guild = guild
         self.__cfg = None
+        self.__cfg_set_from_deco = False
 
         cfg_key = type(self)._cfg_key
         if type(self)._cfg_key is not None:
@@ -459,6 +460,7 @@ class GuildStateBase:
                 top_cfg.set(cfg_key, {})
 
             self.__cfg = top_cfg.get(cfg_key)
+            self.__cfg_set_from_deco = True
 
     @property
     def cfg(self) -> Optional[config.ConfigProtocol]:
@@ -467,6 +469,17 @@ class GuildStateBase:
         Will be None unless the @config_backed decorator is used.
         """
         return self.__cfg
+
+    @cfg.setter
+    def cfg(self, c: config.ConfigProtocol):
+        """Set the config backing this guild state.
+
+        If @config_backed was used, this may not be changed.
+        """
+        if self.__cfg_set_from_deco:
+            raise AttributeError("cfg cannot be set, was set from decorator")
+
+        self.__cfg = c
 
 
 def config_backed(config_key: str):
