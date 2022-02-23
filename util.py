@@ -20,15 +20,21 @@ async def ack(ctx: lightbulb.Context) -> None:
     await ctx.event.message.add_reaction(__ack_char)
 
 
-def code(s: str) -> str:
+def code(s: str, lang: str = "") -> str:
     # Note: Not using any format()s here, so we can construct format strings
     # using the util.code* funcs
-    return "```\n" + s + "\n```"
+    return "".join([
+        "```",
+        lang,
+        "\n",
+        s,
+        "\n```"
+    ])
 
 
-def codelns(lns: Sequence[str]) -> str:
-    return code("\n".join(lns))
+def codelns(lns: Sequence[str], lang: str = "") -> str:
+    return code("\n".join(lns), lang)
 
 
 def codejson(j: Mapping) -> str:
-    return code(json.dumps(j, indent=4))
+    return code(json.dumps(j, indent=4), lang="json")
