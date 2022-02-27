@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import os
 import pathlib
 import logging
@@ -9,7 +10,6 @@ from typing import Optional, Union, Type, Any, TypeVar, Protocol
 import hikari
 import lightbulb
 
-import saru
 from . import job
 from . import config
 from .util import ack
@@ -19,7 +19,7 @@ from collections.abc import Mapping, MutableMapping, Iterator, Coroutine
 logger = logging.getLogger(__name__)
 
 
-GuildEntity = Union[int, hikari.Guild]
+GuildEntity = Union[int, hikari.Guild, lightbulb.Context]
 T = TypeVar('T')
 
 
@@ -38,7 +38,57 @@ def attach(
     bot.subscribe(hikari.GuildLeaveEvent, saru.on_bot_guild_leave)
 
 
+SaruAttachedT = Union[
+    lightbulb.BotApp,
+    lightbulb.Context
+]
+
+
+def single_dispatch_error(f_name: str, obj: Any) -> Any:
+    raise NotImplemented(f"{__name__}.{f_name}(...) not implemented for {type(obj)}")
+
+
+# Get the attached instance of Saru from context.
+@functools.singledispatch
+def get(saru_attached: SaruAttachedT) -> 'Saru':
+    return single_dispatch_error("get", saru_attached)
+
+
+@get.register(lightbulb.Context)
+def _(saru_attached: lightbulb.Context) -> 'Saru':
+    return saru_attached.bot.d.saru
+
+
+@get.register(lightbulb.BotApp)
+def _(saru_attached: lightbulb.BotApp) -> 'Saru':
+    return saru_attached.d.saru
+
+
+@functools.singledispatch
+def guild_id_from_entity(entity: GuildEntity) -> int:
+    return single_dispatch_error("get", entity)
+
+
+@guild_id_from_entity.register(int)
+def _(entity: int) -> int:
+    return entity
+
+
+@guild_id_from_entity.register(hikari.Guild)
+def _(entity: hikari.Guild) -> int:
+    return entity.id
+
+
+@guild_id_from_entity.register(lightbulb.Context)
+def _(entity: lightbulb.Context) -> int:
+    return entity.guild_id
+
+
 class Saru:
+    @classmethod
+    def get(cls, ctx: lightbulb.Context) -> 'Saru':
+        return ctx.bot.d.saru
+
     """Container class implementing a set of tools with Saru."""
     def __init__(
         self,
@@ -110,7 +160,7 @@ class Saru:
         self.crontask = loop.create_task(self.jobcron.run())
 
     # Get the config object for a given job/cron header.
-    def get_jobcfg_for_header(self, header: Union[job.JobHeader, job.CronHeader]) -> config.JsonConfig:
+    def get_jobcfg_for_header(self, header: Union[job.JobHeader, job.CronHeader]) -> config.PathConfigProtocol:
         cfg = self.job_db.get_config(header.guild_id)
         return cfg
 
@@ -255,18 +305,60 @@ class Saru:
     def gstype(self, state_type: Type['GuildStateBase']) -> None:
         self.gs_db.register_cls(state_type)
 
-    # Shortcut to get the config for a given command.
-    # Also supports messages.
-    def cfg(self, guild_entity: GuildEntity):
-        if isinstance(guild_entity, hikari.Guild):
-            id = guild_entity.id
-        elif isinstance(guild_entity, int):
-            id = guild_entity
-        else:
-            raise TypeError("GuildEntity must be either guild or integer.")
+    # Shortcut to get the guild config for a given command.
+    def gcfg(
+        self,
+        guild_entity: GuildEntity,
+        path: Optional[str] = None
+    ) -> config.PathConfigProtocol:
+        """Shortcut to get guild cfg, or a subconfig of one."""
 
+        id = guild_id_from_entity(guild_entity)
         cfg = self.config_db.get_config(id)
-        return cfg
+
+        if path is None:
+            return cfg
+        else:
+            return cfg.path_sub(path)
+
+    def ccfg(self, path: str) -> config.PathConfigProtocol:
+        """Shortcut to get common cfg."""
+        return self.common_config_db.path_sub(path)
+
+    def cfg(
+        self,
+        path: str,
+        guild_entity: Optional[GuildEntity] = None
+    ) -> config.PathConfigProtocol:
+        """Combined shortcut method for getting config objects.
+
+        Provided paths must take one of the following forms:
+        c/... - Common config
+        g/... - Guild config
+
+        If a g/... path is used, guild_entity must not be None.
+        """
+        pathtype, *rest = config.CONFIG_PATH_SPLIT.split(path, 1)
+
+        if pathtype == "g":
+            if guild_entity is None:
+                raise ValueError("guild_entity must not be None for g/... paths")
+
+            if not rest:
+                rest = None
+            else:
+                rest = rest[0]
+
+            return self.gcfg(guild_entity, rest)
+        elif pathtype == "c":
+            if not rest:
+                raise ValueError("must provide config name for c/... path")
+            else:
+                rest = rest[0]
+
+            return self.ccfg(rest)
+        else:
+            raise ValueError("first config node must be either g or c")
 
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
@@ -427,12 +519,12 @@ class MessageTask(job.JobTask):
 ################
 
 class GuildStateBase:
-    _cfg_key = None
+    _cfg_path = None
 
     @classmethod
     async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
         """Shortcut function for getting a GuildState instance from ctx"""
-        db = await ctx.bot.d.saru.gs(cls, ctx.guild_id)
+        db = await get(ctx).gs(cls, ctx.guild_id)
         return db
 
     @classmethod
@@ -443,7 +535,7 @@ class GuildStateBase:
     @classmethod
     def unregister(cls, bot: lightbulb.BotApp):
         """Shortcut function for unregistering a GuildState class from Saru"""
-        gs_db: GuildStateDB = bot.d.saru.gs_db
+        gs_db: GuildStateDB = get(bot).gs_db
         gs_db.unregister_cls(cls)
 
     def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
@@ -452,18 +544,13 @@ class GuildStateBase:
         self.__cfg = None
         self.__cfg_set_from_deco = False
 
-        cfg_key = type(self)._cfg_key
-        if type(self)._cfg_key is not None:
-            top_cfg = bot.d.saru.cfg(guild.id)
-
-            if cfg_key not in top_cfg:
-                top_cfg.set(cfg_key, {})
-
-            self.__cfg = top_cfg.get(cfg_key)
+        cfg_path = type(self)._cfg_path
+        if type(self)._cfg_path is not None:
+            self.__cfg = get(bot).cfg(cfg_path, guild)
             self.__cfg_set_from_deco = True
 
     @property
-    def cfg(self) -> Optional[config.ConfigProtocol]:
+    def cfg(self) -> Optional[config.PathConfigProtocol]:
         """Get the config backing this guild state.
 
         Will be None unless the @config_backed decorator is used.
@@ -471,7 +558,7 @@ class GuildStateBase:
         return self.__cfg
 
     @cfg.setter
-    def cfg(self, c: config.ConfigProtocol):
+    def cfg(self, c: config.PathConfigProtocol):
         """Set the config backing this guild state.
 
         If @config_backed was used, this may not be changed.
@@ -482,12 +569,12 @@ class GuildStateBase:
         self.__cfg = c
 
 
-def config_backed(config_key: str):
+def config_backed(config_path: str):
     """Second order decorator that sets up a backing config for a
     GuildState type.
     """
     def deco(gs_type: Type[GuildStateBase]) -> Type[GuildStateBase]:
-        gs_type._cfg_key = config_key
+        gs_type._cfg_path = config_path
         return gs_type
 
     return deco
@@ -647,7 +734,7 @@ def config_command(
         )
         @lightbulb.implements(implements)
         async def _(ctx: lightbulb.Context) -> None:
-            cfg: config.ConfigProtocol = ctx.bot.d.saru.cfg(ctx.guild_id)
+            cfg: config.ConfigProtocol = get(ctx).gcfg(ctx.guild_id)
             value = ctx.options.value
 
             # GET

@@ -1,14 +1,17 @@
 #
 # Config classes for dynamic, persistent configuration.
-# 
-
+#
+import functools
 import logging
 import json
 import pathlib
+import re
 from datetime import datetime
 
 from collections.abc import Mapping, MutableMapping, MutableSequence
-from typing import Optional, Union, Protocol, Callable
+from typing import Optional, Union, Protocol, Callable, Any, TypeVar
+
+CONFIG_PATH_SPLIT = re.compile(r"/+")
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +34,56 @@ class ConfigBaseProtocol(Protocol):
 
 
 class ConfigProtocol(ConfigBaseProtocol):
+    def sub(self: ConfigBaseProtocol, key: str) -> 'ConfigProtocol': ...
     def set(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None: ...
     def get(self: ConfigBaseProtocol, key: str) -> ConfigValue: ...
-    def get_and_set(self: ConfigBaseProtocol, key: str, f: Callable[[ConfigValue], ConfigValue]) -> None: ...
     def delete(self: ConfigBaseProtocol, key: str, ignore_keyerror: bool = False) -> None: ...
+    def lappend(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None: ...
+    def lremove(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None: ...
+    def get_and_set(self: ConfigBaseProtocol, key: str, f: Callable[[ConfigValue], ConfigValue]) -> None: ...
     def get_and_clear(self: ConfigBaseProtocol) -> MutableMapping[str, ConfigValue]: ...
     def __contains__(self: ConfigBaseProtocol, item: str) -> ConfigValue: ...
 
 
+class HasPathSub(Protocol):
+    def path_sub(self, path: str) -> 'PathConfigProtocol': ...
+
+
+class PathProtocol(HasPathSub):
+    """
+    Protocol allowing operations on various config paths.
+    """
+    def path_get(self, path: str) -> ConfigValue: ...
+    def path_set(self, path: str, value: ConfigValue) -> None: ...
+    def path_delete(self, path: str) -> None: ...
+    def path_lappend(self, path: str, value: ConfigValue) -> None: ...
+    def path_lremove(self, path: str, value: ConfigValue) -> None: ...
+
+
+class PathConfigProtocol(ConfigProtocol, PathProtocol):
+    ...
+
+
 # Mixin for basic configuration functions. Subclasses must implement ConfigBaseProtocol.
 class ConfigMixin:
+    def lappend(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
+        l = self.opts[key]
+
+        if not isinstance(l, MutableSequence):
+            raise TypeError("config item must be a list to be appended")
+
+        l.append(value)
+        self.write()
+
+    def lremove(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
+        l = self.opts[key]
+
+        if not isinstance(l, MutableSequence):
+            raise TypeError("config item must be a list to be removed from")
+
+        l.remove(value)
+        self.write()
+
     def set(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
         self.opts[key] = value
         self.write()
@@ -78,10 +121,133 @@ class ConfigMixin:
 # Enable a config to get sub-configs.
 class SubconfigMixin:
     def sub(self: ConfigBaseProtocol, key: str) -> 'SubConfig':
+        if not isinstance(self.opts[key], MutableMapping):
+            raise TypeError(f"Cannot get subconfig for non-mapping type (key {key})")
+
         return SubConfig(self, key, self.opts[key])
 
 
-class SubConfig(ConfigMixin, SubconfigMixin):
+def _path_iter(
+    cfg: PathConfigProtocol,
+    path: str
+) -> tuple[str, str, bool]:
+    if not path:
+        raise ValueError("path may not be empty or None")
+
+    head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
+    if rest:
+        rest = rest[0]
+    else:
+        rest = ""
+
+    return (
+        head, rest, isinstance(cfg.opts[head], MutableMapping)
+    )
+
+
+_PathifyT = TypeVar(
+    "_PathifyT",
+    Callable[[PathConfigProtocol, str], Any],
+    Callable[[PathConfigProtocol, str, ConfigValue], Any]
+)
+
+
+def _pathify(
+    allow_self_op: bool = True
+):
+    """
+    Use a function that operates on a Config, key, and optionally a ConfigValue,
+    and convert it to a function that allows a config path to be used as the key.
+
+    If allow_self_op is False, then if path does not refer to subconfigs, ex:
+
+    class OnlyPathSub:
+        def path_sub(path: str) -> PathConfigProtocol:
+            ...
+
+        _pathify(allow_self_op=False)
+        def path_get(cfg: PathConfigProtocol, key: str) -> ConfigValue:
+            return cfg.get(key)
+
+    obj = OnlyPathSub(...)
+    obj.path_get("top_level_item")
+
+    ...then, an error will be raised. This mode of operation is meant to allow
+    the creation of path functions on collections of configs that have no config
+    operations (get/set/lappend/lremove/etc...) of their own. Path functions that
+    declare allow_self_op=False MUST be called with at least one subpath, ex:
+
+    obj.path_get("top_level_cfg") #  TypeError
+    obj.path_get("top_level_cfg/item") #  OK
+    obj.path_sub("top_level_cfg") #  OK
+    """
+    def deco(
+        f: _PathifyT
+    ) -> _PathifyT:
+        # Haha this is messy and gross
+        if allow_self_op:
+            @functools.wraps(f)
+            def _(cfg: PathConfigProtocol, path: str, *args):
+                *rest, tail = path.rsplit("/", 1)
+
+                if not rest:
+                    return f(cfg, tail, *args)
+                else:
+                    return f(cfg.path_sub(rest[0]), tail, *args)
+        else:
+            @functools.wraps(f)
+            def _(cfg: HasPathSub, path: str, *args):
+                *rest, tail = path.rsplit("/", 1)
+
+                if not rest:
+                    raise TypeError(f"{type(cfg)} has no config operations.")
+                else:
+                    return f(cfg.path_sub(rest[0]), tail, *args)
+
+        return _
+
+    return deco
+
+
+class ConfigPathMixin:
+    def path_sub(self: PathConfigProtocol, path: str) -> 'PathConfigProtocol':
+        if not path:
+            raise ValueError("path may not be empty or None")
+
+        head, rest, is_dict = _path_iter(self, path)
+
+        if not rest:
+            # Hit end of path, so return the subconfig
+            return self.sub(head)
+        elif rest and not is_dict:
+            # Hit end of config, but we still have path left. Error in this case.
+            raise ValueError("configpath too long")
+        else:
+            # Not and end of path or config, so keep going
+            return self.sub(head).path_sub(rest)
+
+    @_pathify()
+    def path_get(self: PathConfigProtocol, key: str) -> ConfigValue:
+        return self.get(key)
+
+    @_pathify()
+    def path_set(self: PathConfigProtocol, key: str, value: ConfigValue) -> None:
+        self.set(key, value)
+
+    @_pathify()
+    def path_delete(self: PathConfigProtocol, key: str) -> None:
+        self.delete(key)
+
+    @_pathify()
+    def path_lappend(self: PathConfigProtocol, key: str, value: ConfigValue) -> None:
+        self.lappend(key, value)
+
+    @_pathify()
+    def path_lremove(self: PathConfigProtocol, key: str, value: ConfigValue) -> None:
+        self.lremove(key, value)
+
+
+class SubConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
     def __init__(
         self: ConfigBaseProtocol,
         parent: ConfigBaseProtocol,
@@ -117,7 +283,7 @@ class ConfigException(Exception):
 # it's been modified after we last loaded/wrote the config. If so,
 # raise an exception. Use this if you intend to edit the config manually,
 # and want to make sure your modifications aren't overwritten.
-class JsonConfig(ConfigMixin, SubconfigMixin):
+class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
     def __init__(
         self,
         path: pathlib.Path,
@@ -263,7 +429,7 @@ class JsonConfigDB:
 
     # Gets the config for a single guild. If the config for a guild doesn't
     # exist, create it.
-    def get_config(self, cid: Union[int, str]) -> JsonConfig:
+    def get_config(self, cid: Union[int, str]) -> PathConfigProtocol:
         cid = str(cid)
 
         if cid not in self.db:
@@ -276,3 +442,35 @@ class JsonConfigDB:
         template = self.get_template(cid)
 
         self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
+
+    def path_sub(self, path: str) -> 'PathConfigProtocol':
+        head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
+
+        cfg: PathConfigProtocol = self.get_config(head)
+
+        if not rest:
+            return cfg
+        else:
+            return cfg.path_sub(rest[0])
+
+    # TODO: This is ugly as sin, almost an exact repeat of the path
+    #       functions from ConfigPathMixin. Find a better way to do this.
+    @_pathify(allow_self_op=False)
+    def path_get(cfg: PathConfigProtocol, key: str) -> ConfigValue: # noqa
+        return cfg.get(key)
+
+    @_pathify(allow_self_op=False)
+    def path_set(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
+        cfg.set(key, value)
+
+    @_pathify(allow_self_op=False)
+    def path_delete(cfg: PathConfigProtocol, key: str) -> None: # noqa
+        cfg.delete(key)
+
+    @_pathify(allow_self_op=False)
+    def path_lappend(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
+        cfg.lappend(key, value)
+
+    @_pathify(allow_self_op=False)
+    def path_lremove(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
+        cfg.lremove(key, value)

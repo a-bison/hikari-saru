@@ -26,7 +26,7 @@ saru.attach(bot, config_path=Path("your_config_folder"))
 # Define a configuration class. Use multiple GuildState classes between
 # lightbulb extensions to help keep things contained.
 @saru.register(bot)
-@saru.config_backed("myconfig")
+@saru.config_backed("g/myconfig")
 class MyGuildState(saru.GuildStateBase):
     def write_my_value(self, value: str) -> None:
         self.cfg.set("myvalue", value)
@@ -39,7 +39,7 @@ class MyGuildState(saru.GuildStateBase):
 # for more details on the command system.
 @bot.command()
 @lightbulb.option("value", "The value to set.")
-@lightbulb.command("set-my-value")
+@lightbulb.command("set-my-value", "Set my value")
 @lightbulb.implements(lightbulb.PrefixCommand)
 async def set_my_value(ctx: lightbulb.Context) -> None:
     gs = await MyGuildState.get(ctx)
@@ -47,15 +47,15 @@ async def set_my_value(ctx: lightbulb.Context) -> None:
     await ctx.respond("Value set.")
     
     # The wrapper Saru class and all its components may also
-    # be accessed directly from the bot datastore, if you
-    # don't want to use GuildStates.
-    my_config = bot.d.saru.cfg(ctx.guild_id).sub("myconfig")
-    my_config.set("myvalue")
+    # be accessed through a utility method, if you don't want
+    # to use a guildstate.
+    my_config = saru.get(ctx).cfg("g/myconfig", ctx)
+    my_config.set("myvalue", ctx.options.value)
     await ctx.respond("Value set again.")
     
 
 @bot.command()
-@lightbulb.command("get-my-value")
+@lightbulb.command("get-my-value", "Get my value")
 @lightbulb.implements(lightbulb.PrefixCommand)
 async def get_my_value(ctx: lightbulb.Context) -> None:
     gs = await MyGuildState.get(ctx)  
