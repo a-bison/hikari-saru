@@ -5,7 +5,7 @@ import pathlib
 import logging
 import time
 from types import MappingProxyType
-from typing import Optional, Union, Type, Any, TypeVar, Protocol
+from typing import Optional, Union, Type, Any, TypeVar, Protocol, cast
 
 import hikari
 import lightbulb
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 GuildEntity = Union[int, hikari.Guild, lightbulb.Context]
-T = TypeVar('T')
+GuildStateTV = TypeVar('GuildStateTV', bound='GuildStateBase')
 
 
 # Attach a new instance of Saru to a BotApp.
@@ -45,7 +45,7 @@ SaruAttachedT = Union[
 
 
 def single_dispatch_error(f_name: str, obj: Any) -> Any:
-    raise NotImplemented(f"{__name__}.{f_name}(...) not implemented for {type(obj)}")
+    raise NotImplementedError(f"{__name__}.{f_name}(...) not implemented for {type(obj)}")
 
 
 # Get the attached instance of Saru from context.
@@ -81,7 +81,10 @@ def _(entity: hikari.Guild) -> int:
 
 @guild_id_from_entity.register(lightbulb.Context)
 def _(entity: lightbulb.Context) -> int:
-    return entity.guild_id
+    if entity is None:
+        raise ValueError("this context does not have guild_id")
+
+    return cast(int, entity.guild_id)
 
 
 class Saru:
@@ -148,7 +151,7 @@ class Saru:
         self.jobcron.on_delete_schedule(self._cfg_sched_delete)
         self.cronfactory = DiscordCronFactory(
             self.task_registry,
-            self.monkycfg.opts["last_schedule_id"] + 1
+            cast(int, self.monkycfg.opts["last_schedule_id"]) + 1
         )
         self.crontask = None
 
@@ -184,7 +187,7 @@ class Saru:
 
         self.monkycfg.get_and_set(
             "last_schedule_id",
-            lambda val: max(val, header.id)
+            lambda val: max(cast(int, val), header.id)
         )
 
     # Remove deleted schedules from the config DB.
@@ -309,7 +312,8 @@ class Saru:
     def gcfg(
         self,
         guild_entity: GuildEntity,
-        path: Optional[str] = None
+        path: Optional[str] = None,
+        force_create: bool = False
     ) -> config.PathConfigProtocol:
         """Shortcut to get guild cfg, or a subconfig of one."""
 
@@ -319,16 +323,23 @@ class Saru:
         if path is None:
             return cfg
         else:
+            if force_create:
+                cfg.path_create(path)
+
             return cfg.path_sub(path)
 
-    def ccfg(self, path: str) -> config.PathConfigProtocol:
+    def ccfg(self, path: str, force_create: bool = False) -> config.PathConfigProtocol:
         """Shortcut to get common cfg."""
+        if force_create:
+            self.common_config_db.path_create(path)
+
         return self.common_config_db.path_sub(path)
 
     def cfg(
         self,
         path: str,
-        guild_entity: Optional[GuildEntity] = None
+        guild_entity: Optional[GuildEntity] = None,
+        force_create: bool = False
     ) -> config.PathConfigProtocol:
         """Combined shortcut method for getting config objects.
 
@@ -345,18 +356,18 @@ class Saru:
                 raise ValueError("guild_entity must not be None for g/... paths")
 
             if not rest:
-                rest = None
+                sub_path = None
             else:
-                rest = rest[0]
+                sub_path = rest[0]
 
-            return self.gcfg(guild_entity, rest)
+            return self.gcfg(guild_entity, sub_path, force_create)
         elif pathtype == "c":
             if not rest:
                 raise ValueError("must provide config name for c/... path")
             else:
-                rest = rest[0]
+                sub_path = rest[0]
 
-            return self.ccfg(rest)
+            return self.ccfg(sub_path, force_create)
         else:
             raise ValueError("first config node must be either g or c")
 
@@ -390,6 +401,9 @@ class DiscordJobFactory(job.JobFactory):
         task_type: str,
         schedule_id: Optional[int]
     ) -> job.JobHeader:
+        if ctx.guild_id is None:
+            raise ValueError("ctx must have guild id")
+
         header = job.JobHeader(
             self.next_id(),
             task_type,
@@ -425,7 +439,7 @@ class DiscordJobFactory(job.JobFactory):
         guild: Optional[hikari.Guild] = None
     ) -> job.JobTask:
         if guild is None:
-            guild = self.bot.rest.fetch_guild(header.guild_id)
+            guild = await self.bot.rest.fetch_guild(header.guild_id)
 
         task_cls = self.task_registry.get(header.task_type)
         task = task_cls(self.bot, guild)
@@ -450,6 +464,9 @@ class DiscordCronFactory:
         task_type: str,
         cron_str: str
     ) -> job.CronHeader:
+        if ctx.guild_id is None:
+            raise ValueError("ctx must have guild id")
+
         header = job.CronHeader(
             self.id_counter.next_id(),
             self.task_registry.force_str(task_type),
@@ -519,11 +536,14 @@ class MessageTask(job.JobTask):
 ################
 
 class GuildStateBase:
-    _cfg_path = None
+    _cfg_path: Optional[str] = None
 
     @classmethod
-    async def get(cls: Type[T], ctx: lightbulb.Context) -> T:
+    async def get(cls: Type[GuildStateTV], ctx: lightbulb.Context) -> GuildStateTV:
         """Shortcut function for getting a GuildState instance from ctx"""
+        if ctx.guild_id is None:
+            raise ValueError("ctx must have guild id")
+
         db = await get(ctx).gs(cls, ctx.guild_id)
         return db
 
@@ -541,12 +561,12 @@ class GuildStateBase:
     def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
         self.bot = bot
         self.guild = guild
-        self.__cfg = None
+        self.__cfg: Optional[config.PathConfigProtocol] = None
         self.__cfg_set_from_deco = False
 
         cfg_path = type(self)._cfg_path
-        if type(self)._cfg_path is not None:
-            self.__cfg = get(bot).cfg(cfg_path, guild)
+        if cfg_path is not None:
+            self.__cfg = get(bot).cfg(cfg_path, guild, force_create=True)
             self.__cfg_set_from_deco = True
 
     @property
@@ -573,7 +593,7 @@ def config_backed(config_path: str):
     """Second order decorator that sets up a backing config for a
     GuildState type.
     """
-    def deco(gs_type: Type[GuildStateBase]) -> Type[GuildStateBase]:
+    def deco(gs_type: Type[GuildStateTV]) -> Type[GuildStateTV]:
         gs_type._cfg_path = config_path
         return gs_type
 
@@ -584,7 +604,7 @@ def register(bot: lightbulb.BotApp):
     """Second order decorator that calls .register(bot) on the decorated
     type.
     """
-    def deco(gs_type: Type[GuildStateBase]) -> Type[GuildStateBase]:
+    def deco(gs_type: Type[GuildStateTV]) -> Type[GuildStateTV]:
         gs_type.register(bot)
         return gs_type
 
@@ -600,8 +620,11 @@ class GuildRequiredException(GuildStateException):
 # Container for guild specific state that doesn't need to be saved between runs.
 class GuildStateDB:
     def __init__(self, bot: lightbulb.BotApp):
-        self.types = {}
-        self.statedb = {}
+        self.types: MutableMapping[str, Type[GuildStateBase]] = {}
+        self.statedb: MutableMapping[
+            str,
+            MutableMapping[int, GuildStateBase]
+        ] = {}
         self.bot = bot
 
     @staticmethod
@@ -690,19 +713,21 @@ class GuildStateDB:
 
 
 class ConfigCallbackProtocol(Protocol):
+    __name__: str
+
     def __call__(
         self,
         ctx: lightbulb.Context,
         cfg: config.ConfigProtocol,
         key: str,
         value: config.ConfigValue
-    ) -> Coroutine[None]: ...
+    ) -> Coroutine[Any, Any, None]: ...
 
 
 def config_command(
     implements: Type[lightbulb.Command] = lightbulb.PrefixCommand,
     type: Optional[Type] = str,
-    config_key: Optional[str] = None,
+    key: Optional[str] = None,
     name: Optional[str] = None,
     description: Optional[str] = None,
     require_admin: bool = True,
@@ -712,9 +737,11 @@ def config_command(
     Generates a new configuration command.
     """
     def deco(coro: ConfigCallbackProtocol) -> lightbulb.CommandLike:
-        nonlocal config_key
+        if key is None:
+            config_key = coro.__name__
+        else:
+            config_key = key
 
-        config_key = coro.__name__ if not config_key else config_key
         command_name = config_key.replace("_", "-") if not name else name
         command_desc = (
             f"Get/set {config_key.replace('_', ' ').lower()}"
@@ -734,7 +761,16 @@ def config_command(
         )
         @lightbulb.implements(implements)
         async def _(ctx: lightbulb.Context) -> None:
-            cfg: config.ConfigProtocol = get(ctx).gcfg(ctx.guild_id)
+            if ctx.guild_id is None:
+                raise ValueError("ctx must have guild id")
+
+            if not isinstance(ctx.event, hikari.MessageCreateEvent):
+                raise NotImplementedError("not implemented for non-message ctx")
+
+            if ctx.event.message.member is None:
+                raise ValueError("ctx must have a member (invoke in guild only)")
+
+            cfg: config.PathConfigProtocol = get(ctx).gcfg(ctx.guild_id)
             value = ctx.options.value
 
             # GET

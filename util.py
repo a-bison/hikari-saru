@@ -3,6 +3,7 @@ import json
 from collections.abc import Mapping
 from typing import Sequence
 
+import hikari
 import lightbulb
 
 # Character to use to acknowledge commands. Defaults to a check mark.
@@ -17,7 +18,10 @@ def override_ack_emoji(emoji: str) -> None:
 
 async def ack(ctx: lightbulb.Context) -> None:
     """React with an emoji for confirmation. By default, this is a checkmark."""
-    await ctx.event.message.add_reaction(__ack_char)
+    if isinstance(ctx.event, hikari.MessageCreateEvent):
+        await ctx.event.message.add_reaction(__ack_char)
+    else:
+        raise NotImplementedError(f"ack not implemented for {type(ctx.event)}")
 
 
 def code(s: str, lang: str = "") -> str:

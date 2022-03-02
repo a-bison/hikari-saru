@@ -14,7 +14,7 @@ import logging
 import time
 
 from collections.abc import Coroutine, MutableMapping
-from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any
+from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class JobHeader:
         self.cancel = False
 
         # The results of the job, if any.
-        self.results = None
+        self.results: MutableMapping[str, Any] = {}
 
     def as_dict(self) -> MutableMapping[str, Any]:
         return {
@@ -112,7 +112,7 @@ class JobTask(ABC):
 
     @abstractmethod
     async def run(self, header: JobHeader) -> None:
-        raise NotImplemented("Subclass JobTask to implement specific tasks.")
+        raise NotImplementedError("Subclass JobTask to implement specific tasks.")
 
     # Optional function that returns a default dict of properties to be passed
     # into run() on job execution. If None is returned, no defaults will be
@@ -150,13 +150,20 @@ class Job:
         self.complete_event.set()
 
     # Wait for this job to finish.
-    async def wait(self, timeout: Optional[float] = None) -> Coroutine[Mapping]:
+    async def wait(self, timeout: Optional[float] = None) -> Mapping:
         if timeout is None:
             await self.complete_event.wait()
         else:
             await asyncio.wait_for(self.complete_event.wait(), timeout)
 
         return self.header.results
+
+    @staticmethod
+    def force_id(job: Union['Job', int]) -> int:
+        if isinstance(job, Job):
+            return job.header.id
+        else:
+            return job
 
 
 # Simple registry for getting task types.
@@ -265,18 +272,18 @@ class JobQueue:
         else:
             self.loop = eventloop
 
-        self.active_job = None
-        self.active_task = None
-        self.job_queue = asyncio.Queue()
+        self.active_job: Optional[Job] = None
+        self.active_task: Optional[asyncio.Task] = None
+        self.job_queue: asyncio.Queue = asyncio.Queue()
 
         # Job dict used for display purposes, because asyncio.Queue doesn't
         # support peeking
-        self.jobs = collections.OrderedDict()
+        self.jobs: MutableMapping[int, Job] = collections.OrderedDict()
 
-        self.job_submit_callback = None
-        self.job_start_callback = None
-        self.job_stop_callback = None
-        self.job_cancel_callback = None
+        self.job_submit_callback: Optional[JobCallback] = None
+        self.job_start_callback: Optional[JobCallback] = None
+        self.job_stop_callback: Optional[JobCallback] = None
+        self.job_cancel_callback: Optional[JobCallback] = None
 
     async def submit_job(self, job: Job) -> None:
         if self.job_submit_callback is not None:
@@ -319,7 +326,7 @@ class JobQueue:
             logger.info("Job queue stoppped.")
 
     async def mainloop(self) -> None:
-        j = await self.job_queue.get()
+        j: Job = await self.job_queue.get()
 
         if j.header.cancel:
             logger.info("Skipping cancelled job " + str(j.header.id))
@@ -353,19 +360,33 @@ class JobQueue:
         if self.job_stop_callback:
             await self.job_stop_callback(j.header)
 
+    def is_job_running(self, job: Union[Job, int]) -> bool:
+        """Query if a job is actively running."""
+
+        jobid = Job.force_id(job)
+
+        if not self.active_job or not self.active_task:
+            assert not (self.active_job or self.active_task)
+            return False
+
+        if self.active_job.header.id == jobid:
+            return True
+
+        return False
+
     async def canceljob(self, job: Union[Job, int]) -> None:
-        if isinstance(job, Job):
-            job = job.header.id
+        jobid = Job.force_id(job)
 
-        self.jobs[job].header.cancel = True
+        self.jobs[jobid].header.cancel = True
 
-        if self.active_job.header.id == job and self.active_task:
+        if self.is_job_running(jobid):
+            assert self.active_task is not None
             self.active_task.cancel()
 
         if self.job_cancel_callback:
-            await self.job_cancel_callback(self.jobs[job].header)
+            await self.job_cancel_callback(self.jobs[jobid].header)
 
-        del self.jobs[job]
+        del self.jobs[jobid]
 
 
 ##################
@@ -508,10 +529,13 @@ class ScheduleParseException(Exception):
         self.cronstr = cronstr
 
 
+CronT = MutableMapping[str, Optional[int]]
+
+
 # TODO: Fix typing here, needs to be more specific.
 # Parse a schedule string into a dictionary.
 @functools.cache
-def cron_parse(schedule_str: str) -> Mapping:
+def cron_parse(schedule_str: str) -> CronT:
     schedule_str = schedule_str.lower()
 
     # Parse macros first
@@ -519,7 +543,7 @@ def cron_parse(schedule_str: str) -> Mapping:
         schedule_str = schedule_str.replace(macro, repl)
 
     s_split = schedule_str.lower().split()
-    s_dict = {}
+    s_dict: CronT = {}
 
     if len(s_split) < 5:
         raise ScheduleParseException("less than 5 elements", cronstr=schedule_str)
@@ -802,8 +826,7 @@ def cron_next_date_as_datetime(schedule, from_date=None, carry=0):
     return cron_next_to_datetime(cron_next_date(schedule, from_date, carry))
 
 
-class ScheduleCallback(Protocol):
-    def __call__(self, sheader: CronHeader) -> Coroutine[None]: ...
+ScheduleCallback = Callable[[CronHeader], Coroutine[Any, Any, None]]
 
 
 # A scheduler that starts jobs at specific real-world dates.
@@ -814,10 +837,10 @@ class JobCron:
         self.jobfactory = jobfactory
 
         self.schedule_lock = asyncio.Lock()
-        self.schedule = {}
+        self.schedule: MutableMapping[int, CronHeader] = {}
 
-        self.sched_create_callback = None
-        self.sched_delete_callback = None
+        self.sched_create_callback: Optional[ScheduleCallback] = None
+        self.sched_delete_callback: Optional[ScheduleCallback] = None
 
     def on_create_schedule(self, callback: ScheduleCallback) -> None:
         self.sched_create_callback = callback
