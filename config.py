@@ -6,6 +6,7 @@ import logging
 import json
 import pathlib
 import re
+import shutil
 from datetime import datetime
 
 from collections.abc import Mapping, MutableMapping, MutableSequence
@@ -446,8 +447,21 @@ class JsonConfigDB:
             logger.error("Parent directories of config not found.")
             raise
 
+    # Backup the entire configuration to a given path.
+    def backup(self, parent_path: pathlib.Path) -> None:
+        path = self.backup_loc(parent_path)
+
+        if path.exists():
+            shutil.rmtree(path)
+
+        logger.info(f"cfgdb: backup {self.path} to {path}")
+        shutil.copytree(self.path, path)
+
     def cfg_loc(self, cid: Union[int, str]) -> pathlib.Path:
         return self.path / (str(cid) + ".json")
+
+    def backup_loc(self, parent_dir: pathlib.Path) -> pathlib.Path:
+        return parent_dir / (self.path.name + ".backup")
 
     def get_template(self, cid: Union[int, str]) -> Mapping:
         if self.unique_template:
