@@ -12,7 +12,7 @@ from datetime import datetime
 from collections.abc import Mapping, MutableMapping, MutableSequence
 from typing import Optional, Union, Protocol, Callable, Any, TypeVar, cast
 
-import pigutil
+from . import util
 
 CONFIG_PATH_SPLIT = re.compile(r"/+")
 
@@ -397,7 +397,7 @@ class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
             # refuse to write.
             if file_timestamp > self.last_readwrite_date:
                 msg = "{} has been modified, config must be reloaded"
-                logger.error(pigutil.longstr_oneline(f"""
+                logger.error(util.longstr_oneline(f"""
                     check_date conflict: {self.path}:
                     {file_timestamp} > {self.last_readwrite_date}
                     (file_timestamp > self.last_readwrite_date)

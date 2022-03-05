@@ -1,4 +1,5 @@
 import json
+import textwrap
 
 from collections.abc import Mapping
 from typing import Sequence
@@ -42,3 +43,11 @@ def codelns(lns: Sequence[str], lang: str = "") -> str:
 
 def codejson(j: Mapping) -> str:
     return code(json.dumps(j, indent=4), lang="json")
+
+
+def longstr_fix(s: str) -> str:
+    return textwrap.dedent(s).strip()
+
+
+def longstr_oneline(s: str) -> str:
+    return " ".join(longstr_fix(s).split("\n"))
