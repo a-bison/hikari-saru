@@ -11,6 +11,8 @@ from datetime import datetime
 from collections.abc import Mapping, MutableMapping, MutableSequence
 from typing import Optional, Union, Protocol, Callable, Any, TypeVar, cast
 
+import pigutil
+
 CONFIG_PATH_SPLIT = re.compile(r"/+")
 
 logger = logging.getLogger(__name__)
@@ -351,7 +353,7 @@ class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
             self.create()
 
     def __update_last_date(self) -> None:
-        self.last_readwrite_date = datetime.now().timestamp()
+        self.last_readwrite_date = round(datetime.now().timestamp(), 4)
 
     def load(self) -> None:
         template = self.template
@@ -388,12 +390,17 @@ class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
 
     def write(self) -> None:
         if self.path.exists() and self.check_date:
-            file_timestamp = self.path.stat().st_mtime
+            file_timestamp = round(self.path.stat().st_mtime, 4)
 
             # If file was modified after last load/write,
             # refuse to write.
             if file_timestamp > self.last_readwrite_date:
                 msg = "{} has been modified, config must be reloaded"
+                logger.error(pigutil.longstr_oneline(f"""
+                    check_date conflict: {self.path}:
+                    {file_timestamp} > {self.last_readwrite_date}
+                    (file_timestamp > self.last_readwrite_date)
+                """))
                 raise ConfigException(msg.format(self.path))
 
         with open(self.path, 'w') as f:
