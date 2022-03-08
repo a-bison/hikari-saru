@@ -727,6 +727,8 @@ class ConfigCallbackProtocol(Protocol):
 def config_command(
     implements: Type[lightbulb.Command] = lightbulb.PrefixCommand,
     type: Optional[Type] = str,
+    path: str = "g",
+    default_on_non_exist: Any = hikari.UNDEFINED,
     key: Optional[str] = None,
     name: Optional[str] = None,
     description: Optional[str] = None,
@@ -770,8 +772,12 @@ def config_command(
             if ctx.event.message.member is None:
                 raise ValueError("ctx must have a member (invoke in guild only)")
 
-            cfg: config.PathConfigProtocol = get(ctx).gcfg(ctx.guild_id)
+            cfg: config.PathConfigProtocol = get(ctx).cfg(path, ctx.guild_id)
             value = ctx.options.value
+
+            if key not in cfg and default_on_non_exist is not hikari.UNDEFINED:
+                logger.warning(f"cfg_command: {key} set to default {default_on_non_exist}")
+                cfg.set(key, default_on_non_exist)
 
             # GET
             if value is None:
@@ -786,10 +792,15 @@ def config_command(
                     ctx.event.message.member
                 )
 
+                is_admin = (
+                    perms & hikari.Permissions.ADMINISTRATOR or
+                    ctx.author.id == ctx.get_guild().owner_id
+                )
+
                 if perms == hikari.Permissions.NONE:
                     await ctx.respond("Internal error: cache not available")
                     return
-                elif not perms & hikari.Permissions.ADMINISTRATOR:
+                elif not is_admin:
                     await ctx.respond("You must be administrator to set this value.")
                     return
 
