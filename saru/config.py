@@ -12,7 +12,7 @@ from datetime import datetime
 from collections.abc import Mapping, MutableMapping, MutableSequence
 from typing import Optional, Union, Protocol, Callable, Any, TypeVar, cast
 
-from . import util
+from saru import util
 
 CONFIG_PATH_SPLIT = re.compile(r"/+")
 

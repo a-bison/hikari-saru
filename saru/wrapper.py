@@ -10,8 +10,8 @@ from typing import Optional, Union, Type, Any, TypeVar, Protocol, cast
 import hikari
 import lightbulb
 
-from . import job
-from . import config
+from saru import job
+from saru import config
 from .util import ack
 
 from collections.abc import Mapping, MutableMapping, Iterator, Coroutine
