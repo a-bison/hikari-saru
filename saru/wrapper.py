@@ -1,20 +1,20 @@
 import asyncio
 import functools
+import logging
 import os
 import pathlib
-import logging
 import time
+import typing
+from collections.abc import Coroutine, Iterator, Mapping, MutableMapping
 from types import MappingProxyType
-from typing import Optional, Union, Type, Any, TypeVar, Protocol, cast
+from typing import Any, Optional, Protocol, Type, TypeVar, Union, cast
 
 import hikari
 import lightbulb
 
-from saru import job
-from saru import config
-from .util import ack
+from saru import config, job, ConfigValue
 
-from collections.abc import Mapping, MutableMapping, Iterator, Coroutine
+from .util import ack
 
 logger = logging.getLogger(__name__)
 
@@ -44,29 +44,29 @@ SaruAttachedT = Union[
 ]
 
 
-def single_dispatch_error(f_name: str, obj: Any) -> Any:
+def single_dispatch_error(f_name: str, obj: Any) -> typing.NoReturn:
     raise NotImplementedError(f"{__name__}.{f_name}(...) not implemented for {type(obj)}")
 
 
 # Get the attached instance of Saru from context.
 @functools.singledispatch
 def get(saru_attached: SaruAttachedT) -> 'Saru':
-    return single_dispatch_error("get", saru_attached)
+    return typing.cast(Saru, single_dispatch_error("get", saru_attached))
 
 
 @get.register(lightbulb.Context)
 def _(saru_attached: lightbulb.Context) -> 'Saru':
-    return saru_attached.bot.d.saru
+    return typing.cast(Saru, saru_attached.bot.d.saru)
 
 
 @get.register(lightbulb.BotApp)
 def _(saru_attached: lightbulb.BotApp) -> 'Saru':
-    return saru_attached.d.saru
+    return typing.cast(Saru, saru_attached.d.saru)
 
 
 @functools.singledispatch
 def guild_id_from_entity(entity: GuildEntity) -> int:
-    return single_dispatch_error("get", entity)
+    return typing.cast(int, single_dispatch_error("get", entity))
 
 
 @guild_id_from_entity.register(int)
@@ -90,7 +90,7 @@ def _(entity: lightbulb.Context) -> int:
 class Saru:
     @classmethod
     def get(cls, ctx: lightbulb.Context) -> 'Saru':
-        return ctx.bot.d.saru
+        return typing.cast(Saru, ctx.bot.d.saru)
 
     """Container class implementing a set of tools with Saru."""
     def __init__(
@@ -200,37 +200,37 @@ class Saru:
     # Resume all jobs that never properly finished from the last run.
     # Called from on_ready() to ensure that all discord state is init'd
     # properly
-    async def resume_jobs(self):
+    async def resume_jobs(self) -> None:
         for guild_id, cfg in self.job_db.db.items():
             jobs = cfg.sub("jobs").get_and_clear()
 
             for job_id, job_header in jobs.items():
-                await self.resume_job(job_header)
+                await self.resume_job(typing.cast(Mapping, job_header))
 
             msg = "Resumed {} unfinished job(s) in guild {}"
             logger.info(msg.format(len(jobs), guild_id))
 
     # Resume job from a loaded job header dict.
-    async def resume_job(self, header):
+    async def resume_job(self, header: Mapping) -> None:
         job = await self.jobfactory.create_job_from_dict(header)
         await self.jobqueue.submit_job(job)
 
     # Reschedule all cron entries from cfg
-    async def reschedule_all_cron(self):
+    async def reschedule_all_cron(self) -> None:
         for guild_id, cfg in self.job_db.db.items():
             crons = cfg.sub("cron").get_and_clear()
 
             for sched_id, sched_header in crons.items():
-                await self.reschedule_cron(sched_header)
+                await self.reschedule_cron(typing.cast(Mapping, sched_header))
 
             msg = "Loaded {} schedule(s) in guild {}"
             logger.info(msg.format(len(crons), guild_id))
 
-    async def reschedule_cron(self, header_dict):
+    async def reschedule_cron(self, header_dict: Mapping) -> None:
         header = await self.cronfactory.create_cronheader_from_dict(header_dict)
         await self.jobcron.create_schedule(header)
 
-    async def join_guilds_offline(self):
+    async def join_guilds_offline(self) -> None:
         """Create config entries for any guilds that were joined while offline."""
         # TODO Investigate bug in fetch_my_guilds: newest_first appears to repeat guilds?
         async for guild in self.bot.rest.fetch_my_guilds():
@@ -253,12 +253,12 @@ class Saru:
 
         logger.info("Saru ready.")
 
-    async def on_bot_guild_join(self, event: hikari.GuildJoinEvent):
+    async def on_bot_guild_join(self, event: hikari.GuildJoinEvent) -> None:
         """Optional guild join event handler."""
         g = event.guild
         logger.info(f"Joined new guild: {g.name}({g.id})")
 
-    async def on_bot_guild_leave(self, event: hikari.GuildLeaveEvent):
+    async def on_bot_guild_leave(self, event: hikari.GuildLeaveEvent) -> None:
         """Guild leave event handler. Must be fired in order to avoid corruption of guild state DB."""
         g = event.old_guild
         if g is None:
@@ -374,7 +374,7 @@ class Saru:
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
     # guild property.
-    async def gs(self, state_type: Type['GuildStateBase'], guild_entity: GuildEntity):
+    async def gs(self, state_type: Type[GuildStateTV], guild_entity: GuildEntity) -> GuildStateTV:
         return await self.gs_db.get(state_type, guild_entity)
 
 
@@ -492,26 +492,29 @@ class DiscordCronFactory:
 class MessageTask(job.JobTask):
     MAX_MSG_DISPLAY_LEN = 15
 
-    def __init__(self, bot, guild):
+    def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
         super().__init__()
 
         self.bot = bot
         self.guild = guild
 
-    async def run(self, header):
+    async def run(self, header: job.JobHeader) -> None:
         p = header.properties
-        channel = self.guild.get_channel(p["channel"])
+        channel = typing.cast(hikari.TextableChannel, self.guild.get_channel(p["channel"]))
 
-        for _ in range(p["post_number"]):
-            await channel.send(p["message"])
-            await asyncio.sleep(p["post_interval"])
+        if channel is not None:
+            for _ in range(p["post_number"]):
+                await channel.send(p["message"])
+                await asyncio.sleep(p["post_interval"])
+        else:
+            raise Exception(f"Channel id {p['channel']} not found.")
 
     @classmethod
-    def task_type(cls):
+    def task_type(cls) -> str:
         return "message"
 
     @classmethod
-    def property_default(cls, properties):
+    def property_default(cls, properties: Mapping) -> Mapping:
         return {
             "message": "hello",
             "channel": 0,
@@ -519,7 +522,7 @@ class MessageTask(job.JobTask):
             "post_number": 1
         }
 
-    def display(self, header):
+    def display(self, header: job.JobHeader) -> str:
         p = header.properties
         msg = p["message"]
 
@@ -548,12 +551,12 @@ class GuildStateBase:
         return db
 
     @classmethod
-    def register(cls, bot: lightbulb.BotApp):
+    def register(cls, bot: lightbulb.BotApp) -> None:
         """Shortcut function for registering a GuildState class to Saru."""
         bot.d.saru.gstype(cls)
 
     @classmethod
-    def unregister(cls, bot: lightbulb.BotApp):
+    def unregister(cls, bot: lightbulb.BotApp) -> None:
         """Shortcut function for unregistering a GuildState class from Saru"""
         gs_db: GuildStateDB = get(bot).gs_db
         gs_db.unregister_cls(cls)
@@ -578,7 +581,7 @@ class GuildStateBase:
         return self.__cfg
 
     @cfg.setter
-    def cfg(self, c: config.PathConfigProtocol):
+    def cfg(self, c: config.PathConfigProtocol) -> None:
         """Set the config backing this guild state.
 
         If @config_backed was used, this may not be changed.
@@ -589,7 +592,7 @@ class GuildStateBase:
         self.__cfg = c
 
 
-def config_backed(config_path: str):
+def config_backed(config_path: str) -> typing.Callable[[Type[GuildStateTV]], Type[GuildStateTV]]:
     """Second order decorator that sets up a backing config for a
     GuildState type.
     """
@@ -600,13 +603,15 @@ def config_backed(config_path: str):
     return deco
 
 
-def register(bot: lightbulb.BotApp):
+def register(bot: lightbulb.BotApp) -> typing.Callable[[Type[GuildStateTV]], Type[GuildStateTV]]:
     """Second order decorator that calls .register(bot) on the decorated
     type.
     """
     def deco(gs_type: Type[GuildStateTV]) -> Type[GuildStateTV]:
         gs_type.register(bot)
         return gs_type
+
+    return deco
 
 
 class GuildStateException(Exception):
@@ -628,14 +633,10 @@ class GuildStateDB:
         self.bot = bot
 
     @staticmethod
-    def typekey(state_type: Type[GuildStateBase]) -> str:
+    def typekey(state_type: Type[GuildStateTV]) -> str:
         return state_type.__qualname__
 
-    def register_cls(self, state_type: Type[GuildStateBase]) -> None:
-        if not issubclass(state_type, GuildStateBase):
-            msg = "GuildState type {} must subclass GuildStateBase"
-            raise GuildStateException(msg.format(state_type.__name__))
-
+    def register_cls(self, state_type: Type[GuildStateTV]) -> None:
         k = self.typekey(state_type)
         if k in self.types:
             msg = "GuildState type {} is already registered."
@@ -644,7 +645,7 @@ class GuildStateDB:
         self.types[k] = state_type
         self.statedb[k] = {}
 
-    def unregister_cls(self, state_type: Type[GuildStateBase]) -> None:
+    def unregister_cls(self, state_type: Type[GuildStateTV]) -> None:
         k = self.typekey(state_type)
         self.__check_typekey(k)
 
@@ -672,17 +673,22 @@ class GuildStateDB:
     # Get guild state dict for a given type, and the type itself.
     def __get_of_type(
         self,
-        state_type: Type[GuildStateBase]
-    ) -> tuple[Type[GuildStateBase], MutableMapping[int, GuildStateBase]]:
+        state_type: Type[GuildStateTV]
+    ) -> tuple[Type[GuildStateTV], MutableMapping[int, GuildStateTV]]:
 
         k = self.typekey(state_type)
         self.__check_typekey(k)
 
-        return self.types[k], self.statedb[k]
+        # Assume we got the right type here, since we're the ones populating it
+        # in this class.
+        return (
+            typing.cast(Type[GuildStateTV], self.types[k]),
+            typing.cast(MutableMapping[int, GuildStateTV], self.statedb[k])
+        )
 
     # Get a state instance from the DB. If there's no
     # instance for the given guild, one will be created.
-    async def get(self, state_type: Type[GuildStateBase], guild_entity: GuildEntity) -> GuildStateBase:
+    async def get(self, state_type: Type[GuildStateTV], guild_entity: GuildEntity) -> GuildStateTV:
         guild, guild_id = await self._get_guild_and_id(guild_entity)
         state_type, guild_states = self.__get_of_type(state_type)
 
@@ -702,7 +708,7 @@ class GuildStateDB:
                 del states[guild_id]
 
     # Iterate over all guild states of a given type
-    def iter_over_type(self, state_type: Type[GuildStateBase]) -> Iterator[GuildStateBase]:
+    def iter_over_type(self, state_type: Type[GuildStateTV]) -> Iterator[GuildStateTV]:
         state_type, guild_states = self.__get_of_type(state_type)
         yield from guild_states.values()
 
@@ -734,7 +740,7 @@ def config_command(
     description: Optional[str] = None,
     require_admin: bool = True,
     **command_kwargs: Any
-):
+) -> typing.Callable[[ConfigCallbackProtocol], lightbulb.CommandLike]:
     """
     Generates a new configuration command.
     """
@@ -775,9 +781,9 @@ def config_command(
             cfg: config.PathConfigProtocol = get(ctx).cfg(path, ctx.guild_id)
             value = ctx.options.value
 
-            if key not in cfg and default_on_non_exist is not hikari.UNDEFINED:
-                logger.warning(f"cfg_command: {key} set to default {default_on_non_exist}")
-                cfg.set(key, default_on_non_exist)
+            if config_key not in cfg and default_on_non_exist is not hikari.UNDEFINED:
+                logger.warning(f"cfg_command: {config_key} set to default {default_on_non_exist}")
+                cfg.set(config_key, default_on_non_exist)
 
             # GET
             if value is None:
@@ -792,9 +798,16 @@ def config_command(
                     ctx.event.message.member
                 )
 
+                maybe_guild = ctx.get_guild()
+
+                if maybe_guild is None:
+                    raise Exception("Could not get guild from context.")
+                else:
+                    guild = maybe_guild
+
                 is_admin = (
                     perms & hikari.Permissions.ADMINISTRATOR or
-                    ctx.author.id == ctx.get_guild().owner_id
+                    ctx.author.id == guild.owner_id
                 )
 
                 if perms == hikari.Permissions.NONE:

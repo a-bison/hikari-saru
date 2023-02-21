@@ -1,9 +1,8 @@
 import json
 import numbers
 import textwrap
-
 from collections.abc import Mapping
-from typing import Sequence, Optional
+from typing import Optional, Sequence
 
 import hikari
 import lightbulb
@@ -102,7 +101,7 @@ class RangeLimitError(Exception):
         self.high = high
         self.valname = valname
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.high is None:
             msg = f"`{self.valname}` cannot go below {self.low}"
         elif self.low is None:

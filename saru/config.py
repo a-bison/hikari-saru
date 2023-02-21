@@ -2,15 +2,14 @@
 # Config classes for dynamic, persistent configuration.
 #
 import functools
-import logging
 import json
+import logging
 import pathlib
 import re
 import shutil
-from datetime import datetime
-
 from collections.abc import Mapping, MutableMapping, MutableSequence
-from typing import Optional, Union, Protocol, Callable, Any, TypeVar, cast
+from datetime import datetime
+from typing import Any, Callable, Optional, Protocol, TypeVar, Union, cast
 
 from saru import util
 
@@ -48,7 +47,7 @@ class ConfigProtocol(ConfigBaseProtocol, Protocol):
     def lremove(self, key: str, value: ConfigValue) -> None: ...
     def get_and_set(self, key: str, f: Callable[[ConfigValue], ConfigValue]) -> None: ...
     def get_and_clear(self) -> MutableMapping[str, ConfigValue]: ...
-    def __contains__(self, item: str) -> ConfigValue: ...
+    def __contains__(self, item: Optional[str]) -> bool: ...
 
 
 class _HasPathSub(Protocol):
@@ -128,8 +127,8 @@ class ConfigMixin:
 
         return cfg
 
-    def __contains__(self: ConfigBaseProtocol, item: str) -> ConfigValue:
-        return item in self.opts
+    def __contains__(self: ConfigBaseProtocol, item: Optional[str]) -> bool:
+        return item is not None and item in self.opts
 
 
 # Enable a config to get sub-configs.
@@ -164,16 +163,16 @@ def _path_iter(
 
 _PathifyT = TypeVar(
     "_PathifyT",
-    Callable[[_ConfigWithPathSub, str], Any],
-    Callable[[_ConfigWithPathSub, str, ConfigValue], Any],
-    Callable[[_HasPathSub, str], Any],
-    Callable[[_HasPathSub, str, ConfigValue], Any]
+    Callable[[PathConfigProtocol, str], Any],
+    Callable[[PathConfigProtocol, str, ConfigValue], Any],
+    Callable[[PathConfigProtocol, str], Any],
+    Callable[[PathConfigProtocol, str, ConfigValue], Any]
 )
 
 
 def _pathify(
     allow_self_op: bool = True
-):
+) -> Callable[[_PathifyT], _PathifyT]:
     """
     Use a function that operates on a Config, key, and optionally a ConfigValue,
     and convert it to a function that allows a config path to be used as the key.
@@ -206,7 +205,7 @@ def _pathify(
         # Haha this is messy and gross
         if allow_self_op:
             @functools.wraps(f)
-            def _(cfg: _ConfigWithPathSub, path: str, *args):
+            def _(cfg: PathConfigProtocol, path: str, *args: Any) -> Any:
                 tail: str
                 rest: Union[str, list[str]]
 
@@ -218,7 +217,7 @@ def _pathify(
                     return f(cfg.path_sub(rest[0]), tail, *args)
         else:
             @functools.wraps(f)
-            def _(cfg: _HasPathSub, path: str, *args):
+            def _(cfg: PathConfigProtocol, path: str, *args: Any) -> Any:
                 tail: str
                 rest: Union[str, list[str]]
 
@@ -335,7 +334,7 @@ class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
     def __init__(
         self,
         path: pathlib.Path,
-        template: Mapping = None,
+        template: Optional[Mapping] = None,
         check_date: bool = False
     ):
         super().__init__()
@@ -428,7 +427,7 @@ class JsonConfigDB:
         self.db: MutableMapping[str, JsonConfig] = {}
 
         self.path = path
-        self.template: Mapping = template if template is not None else {}
+        self.template: Mapping[str, Mapping] = template if template is not None else {}
         self.unique_template = unique_template
 
         if path.is_dir():

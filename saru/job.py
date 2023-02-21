@@ -3,18 +3,20 @@
 # JobCron tasks, as well as related tools.
 #
 
-from abc import ABC, abstractmethod
-from datetime import datetime, MINYEAR, MAXYEAR
 import asyncio
 import calendar
 import collections
 import copy
+import dataclasses
 import functools
 import logging
 import time
-
+import typing
+from abc import ABC, abstractmethod
 from collections.abc import Coroutine, MutableMapping
-from typing import Sequence, Mapping, Optional, Union, Type, Protocol, Any, Callable
+from datetime import MAXYEAR, MINYEAR, datetime
+from typing import (Any, Callable, Mapping, Optional, Protocol, Sequence, Type,
+                    Union)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ class JobHeader:
 
     def __init__(
         self,
-        id,
+        id: int,
         task_type: str,
         properties: Mapping,
         owner_id: int,
@@ -108,7 +110,7 @@ class JobHeader:
 
 # Task base class. Subclass this to create your own Tasks.
 class JobTask(ABC):
-    def __init__(self, *_, **__): ...
+    def __init__(self, *_: typing.Any, **__: typing.Any) -> None: ...
 
     @abstractmethod
     async def run(self, header: JobHeader) -> None:
@@ -146,7 +148,7 @@ class Job:
         self.complete_event = asyncio.Event()
 
     # Marks this job as complete, notifies all coroutines waiting on it.
-    def mark_complete(self):
+    def mark_complete(self) -> None:
         self.complete_event.set()
 
     # Wait for this job to finish.
@@ -168,8 +170,8 @@ class Job:
 
 # Simple registry for getting task types.
 class TaskRegistry:
-    def __init__(self):
-        self.tasks = {}
+    def __init__(self) -> None:
+        self.tasks: MutableMapping[str, Type[JobTask]] = {}
 
     def register(self, cls: Type[JobTask]) -> None:
         if not hasattr(cls, "task_type"):
@@ -213,25 +215,25 @@ class JobFactory(ABC):
         self.task_registry = task_registry
 
     # Get the next available job ID.
-    def next_id(self):
+    def next_id(self) -> int:
         return self.id_counter.next_id()
 
     # Create a jobheader from a schedule entry
-    async def create_jobheader_from_cron(self, cron):
+    async def create_jobheader_from_cron(self, cron: 'CronHeader') -> JobHeader:
         return cron.as_jobheader(
             self.next_id(),
             int(time.time())
         )
 
     # Create a jobheader from an existing dictionary
-    async def create_jobheader_from_dict(self, header):
+    async def create_jobheader_from_dict(self, header: Mapping) -> JobHeader:
         return JobHeader.from_dict(
             self.next_id(),
             header
         )
 
     # Create a job using just the header.
-    async def create_job_from_jobheader(self, header):
+    async def create_job_from_jobheader(self, header: JobHeader) -> Job:
         task = await self.create_task(header)
         j = Job(header, task)
 
@@ -245,18 +247,18 @@ class JobFactory(ABC):
         return j
 
     # Create a job from a schedule entry
-    async def create_job_from_cron(self, cron):
+    async def create_job_from_cron(self, cron: 'CronHeader') -> Job:
         header = await self.create_jobheader_from_cron(cron)
         return await self.create_job_from_jobheader(header)
 
     # Create a job from an existing dictionary (typically loaded from cfg)
-    async def create_job_from_dict(self, header):
-        header = await self.create_jobheader_from_dict(header)
-        return await self.create_job_from_jobheader(header)
+    async def create_job_from_dict(self, header: Mapping) -> Job:
+        jobheader = await self.create_jobheader_from_dict(header)
+        return await self.create_job_from_jobheader(jobheader)
 
     # Create a new task using a jobheader.
     @abstractmethod
-    async def create_task(self, header):
+    async def create_task(self, header: JobHeader) -> JobTask:
         pass
 
 
@@ -266,7 +268,7 @@ class JobCallback(Protocol):
 
 # A single job queue. Can run one job at a time.
 class JobQueue:
-    def __init__(self, eventloop: asyncio.AbstractEventLoop = None):
+    def __init__(self, eventloop: Optional[asyncio.AbstractEventLoop] = None):
         if eventloop is None:
             self.loop = asyncio.get_event_loop()
         else:
@@ -475,7 +477,7 @@ class CronHeader:
 
         # A python datetime object representing the next time this schedule
         # will run. Used by a schedule dispatcher to avoid missing a job fire.
-        self.next = None
+        self.next: Optional[datetime] = None
 
     def as_dict(self) -> MutableMapping[str, Any]:
         return {
@@ -523,13 +525,26 @@ class CronHeader:
 
 
 class ScheduleParseException(Exception):
-    def __init__(self, *args: Any, cronstr: str = None):
+    def __init__(self, *args: Any, cronstr: Optional[str] = None):
         super().__init__(*args)
 
         self.cronstr = cronstr
 
 
 CronT = MutableMapping[str, Optional[int]]
+
+
+@dataclasses.dataclass
+class _SchedIntermediate:
+    minute: Optional[int]
+    hour: Optional[int]
+    dayofmonth: list[int]
+    month: Optional[int]
+    dayofweek: Optional[int]
+    original_dayofmonth: list[int] = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        self.original_dayofmonth = list(self.dayofmonth)
 
 
 # TODO: Fix typing here, needs to be more specific.
@@ -627,9 +642,19 @@ def cron_match(schedule_str: str, timedate_obj: datetime) -> bool:
 # If carry is supplied, one minute will be added to the from_date. This can
 # help avoid multiple schedule firings if the from_date already matches the
 # schedule.
-def cron_next_date(schedule, from_date=None, carry=0):
-    # Make a copy so we can freely modify.
-    schedule = dict(schedule)
+def cron_next_date(
+    schedule: CronT,
+    from_date: Optional[datetime] = None,
+    carry: int = 0
+) -> Mapping[str, int]:
+    # Convert to object form so we can freely modify.
+    sched_intermediate: _SchedIntermediate = _SchedIntermediate(
+        minute=schedule["minute"],
+        hour=schedule["hour"],
+        dayofweek=schedule["dayofweek"],
+        month=schedule["month"],
+        dayofmonth=([] if schedule["dayofmonth"] is None else [schedule["dayofmonth"]])
+    )
 
     if from_date is not None:
         current_date = from_date
@@ -644,26 +669,16 @@ def cron_next_date(schedule, from_date=None, carry=0):
         "year": current_date.year
     }
 
-    if isinstance(schedule["dayofmonth"], int):
-        schedule["dayofmonth"] = [schedule["dayofmonth"]]
-
-    # Copy original in case we need to recalculate dayofmonth for month/year
-    # changes.
-    if schedule["dayofmonth"] is not None:
-        schedule["_orig_dayofmonth"] = list(schedule["dayofmonth"])
-    else:
-        schedule["_orig_dayofmonth"] = []
-
     next_date["minute"], carry = _next_elem("minute", next_date["minute"],
-                                            carry, next_date, schedule)
+                                            carry, next_date, sched_intermediate)
     next_date["hour"], carry = _next_elem("hour", next_date["hour"],
-                                          carry, next_date, schedule)
+                                          carry, next_date, sched_intermediate)
 
     # Day of month is tricky. If there was a carry, that means we flipped
     # to the next month, and potentially the next year. If that's the case,
     # then we need to do a second round.
     new_day, carry = _cron_next_day(
-        schedule,
+        sched_intermediate,
         carry,
         day=next_date["dayofmonth"],
         month=next_date["month"],
@@ -673,7 +688,7 @@ def cron_next_date(schedule, from_date=None, carry=0):
     # Only do another round if dayofweek is present.
     # TODO Evaluate leap year edge case. May need to do another round
     # regardless of dayofweek.
-    if carry > 0 and schedule["dayofweek"] is not None:
+    if carry > 0 and sched_intermediate.dayofweek is not None:
         # We flipped month, so do another round, starting at the first day
         # of the month. la = lookahead
         month_la = next_date["month"]
@@ -689,7 +704,7 @@ def cron_next_date(schedule, from_date=None, carry=0):
             month_la += 1
 
         new_day, extra_carry = _cron_next_day(
-            schedule, 0,
+            sched_intermediate, 0,
             day=1,
             month=month_la,
             year=year_la
@@ -704,7 +719,7 @@ def cron_next_date(schedule, from_date=None, carry=0):
     # days need to be recalculated, but this doesn't happen.
     next_date["dayofmonth"] = new_day
     next_date["month"], carry = _next_elem("month", next_date["month"],
-                                           carry, next_date, schedule)
+                                           carry, next_date, sched_intermediate)
 
     # Don't need full elem calculation for year, so just bump it if there
     # was a carry.
@@ -713,17 +728,24 @@ def cron_next_date(schedule, from_date=None, carry=0):
     return next_date
 
 
-def _cron_next_day(schedule, carry, day, month, year):
+def _cron_next_day(
+    schedule: _SchedIntermediate,
+    carry: int,
+    day: int,
+    month: int,
+    year: int
+) -> typing.Tuple[int, int]:
     # If dayofweek is present, fold it into dayofmonth to make things
     # easier to calculate.
-    if schedule["dayofweek"] is not None:
+    if schedule.dayofweek is not None:
         weekdays = cron_calc_days(
             year,
             month,
-            schedule["dayofweek"]
+            schedule.dayofweek
         )
 
-        schedule["dayofmonth"] = sorted(set(schedule["_orig_dayofmonth"] + weekdays))
+        # Join, convert to set to remove dupes, and sort.
+        schedule.dayofmonth = sorted({*schedule.original_dayofmonth, *weekdays})
 
     newday, carry = _next_elem(
         "dayofmonth",
@@ -737,7 +759,7 @@ def _cron_next_day(schedule, carry, day, month, year):
 
 
 # Calculate the upper and lower bounds for a given element.
-def _limit_elem(elem_name, t):
+def _limit_elem(elem_name: str, t: Mapping) -> typing.Tuple[int, int]:
     if elem_name == "dayofmonth":
         upper = calendar.monthrange(t["year"], t["month"])[1]
         return 1, upper
@@ -750,8 +772,14 @@ def _limit_elem(elem_name, t):
 
 
 # Calculate the next element
-def _next_elem(elem_name, elem, carry, t, schedule):
-    sched_elem = schedule[elem_name]
+def _next_elem(
+    elem_name: str,
+    elem: int,
+    carry: int,
+    t: Mapping,
+    schedule: _SchedIntermediate
+) -> typing.Tuple[int, int]:
+    sched_elem: Union[int, Sequence[int], None] = getattr(schedule, elem_name)
     lower, upper = _limit_elem(elem_name, t)
 
     new_elem = elem + carry
@@ -822,7 +850,11 @@ def cron_next_to_datetime(cron_next: Mapping) -> datetime:
 
 
 # Get next date as datetime.
-def cron_next_date_as_datetime(schedule, from_date=None, carry=0):
+def cron_next_date_as_datetime(
+    schedule: CronT,
+    from_date: Optional[datetime] = None,
+    carry: int = 0
+) -> datetime:
     return cron_next_to_datetime(cron_next_date(schedule, from_date, carry))
 
 
@@ -960,7 +992,7 @@ class JobCron:
 class BlockerTask(JobTask):
     # Ignore any arguments passed in to retain compatibility with all job
     # factories.
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__()
 
     @classmethod
