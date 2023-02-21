@@ -30,7 +30,7 @@ repository = "https://github.com/a-bison/hikari-saru"
 packages = ["saru"]
 
 [tool.setuptools.dynamic]
-version = { attr = "saru.__version__"}
+version = {attr = "saru.__version__"}
 
 [tool.mypy]
 disallow_untyped_decorators = true
