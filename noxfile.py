@@ -3,7 +3,7 @@ from nox import options
 
 import toml
 
-options.sessions = ["format", "mypy"]
+options.sessions = ["format", "mypy", "test"]
 
 
 def get_project_deps():
@@ -23,6 +23,13 @@ def mypy(session):
 def format(session):
     session.install("isort")
     session.run("isort", "saru")
+
+
+@nox.session
+def test(session):
+    session.install("pytest", *get_project_deps())
+    session.install("-e", ".")
+    session.run("pytest")
 
 
 @nox.session(reuse_venv=True)

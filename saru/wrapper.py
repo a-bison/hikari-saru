@@ -12,7 +12,7 @@ from typing import Any, Optional, Protocol, Type, TypeVar, Union, cast
 import hikari
 import lightbulb
 
-from saru import config, job, ConfigValue
+from saru import config, job
 
 from .util import ack
 
@@ -87,6 +87,9 @@ def _(entity: lightbulb.Context) -> int:
     return cast(int, entity.guild_id)
 
 
+SARU_INTERNAL_CFG = "__saru_internal"
+
+
 class Saru:
     @classmethod
     def get(cls, ctx: lightbulb.Context) -> 'Saru':
@@ -97,42 +100,47 @@ class Saru:
         self,
         bot: lightbulb.BotApp,
         config_path: pathlib.Path,
-        cfgtemplate: Mapping = MappingProxyType({}),
-        common_cfgtemplate: Mapping = MappingProxyType({})
+        guild_cfgtemplate: config.ConfigTemplate,
+        common_cfgtemplate: Mapping[str, config.ConfigTemplate] = MappingProxyType({})
     ):
         self.bot = bot
         self.loop = asyncio.get_event_loop()
 
-        self.__cfgtemplate = cfgtemplate
+        self.__guild_cfgtemplate = guild_cfgtemplate
 
-        self.__common_cfgtemplate = dict(common_cfgtemplate)
-        self.__common_cfgtemplate["_monky"] = {
+        self.__common_cfgtemplate: typing.MutableMapping = dict(common_cfgtemplate)
+        self.__common_cfgtemplate[SARU_INTERNAL_CFG] = config.ConfigTemplate({
             # save the last schedule id, so we don't overlap new schedules
             # with old ones
             "last_schedule_id": 0
-        }
+        })
 
         if not config_path.exists():
+            logger.warning(f"Saru: Config path {config_path} does not exist, creating...")
             os.makedirs(config_path)
 
-        self.config_db = config.JsonConfigDB(
+        self.guild_config_directory = config.JsonConfigDirectory(
             config_path / "guildcfg",
-            template=self.__cfgtemplate
+            template=self.__guild_cfgtemplate
         )
-        self.common_config_db = config.JsonConfigDB(
+        self.common_config_directory = config.JsonConfigDirectory(
             config_path / "commoncfg",
-            template=self.__common_cfgtemplate,
-            unique_template=True
+            template=self.__common_cfgtemplate
         )
-        self.job_db = config.JsonConfigDB(
+        self.job_db = config.JsonConfigDirectory(
             config_path / "jobdb",
-            template={
-                "jobs": {},
-                "cron": {}
-            }
+            template=config.ConfigTemplate(
+                rollback_on_failure=True,
+                paths={
+                    "jobs": {},
+                    "cron": {}
+                }
+            )
         )
         self.gs_db = GuildStateDB(self.bot)
-        self.monkycfg = self.common_config_db.get_config("_monky")
+
+        self.common_config_directory.ensure_exists(SARU_INTERNAL_CFG)
+        self.monkycfg = self.common_config_directory[SARU_INTERNAL_CFG]
 
         # Task registry
         self.task_registry = job.TaskRegistry()
@@ -151,7 +159,7 @@ class Saru:
         self.jobcron.on_delete_schedule(self._cfg_sched_delete)
         self.cronfactory = DiscordCronFactory(
             self.task_registry,
-            cast(int, self.monkycfg.opts["last_schedule_id"]) + 1
+            cast(int, self.monkycfg["last_schedule_id"]) + 1
         )
         self.crontask = None
 
@@ -163,8 +171,9 @@ class Saru:
         self.crontask = loop.create_task(self.jobcron.run())
 
     # Get the config object for a given job/cron header.
-    def get_jobcfg_for_header(self, header: Union[job.JobHeader, job.CronHeader]) -> config.PathConfigProtocol:
-        cfg = self.job_db.get_config(header.guild_id)
+    def get_jobcfg_for_header(self, header: Union[job.JobHeader, job.CronHeader]) -> config.Config:
+        self.job_db.ensure_exists(header.guild_id)
+        cfg = self.job_db[header.guild_id]
         return cfg
 
     # INTERNAL JOB EVENTS
@@ -172,28 +181,35 @@ class Saru:
     # When a job is submitted, create an entry in the config DB.
     async def _cfg_job_create(self, header: job.JobHeader) -> None:
         cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("jobs").set(str(header.id), header.as_dict())
+        cfg[f"jobs/{header.id}"] = header.as_dict()
+        cfg.write()
 
     # Once a job is done, delete it from the config db.
     async def _cfg_job_delete(self, header: job.JobHeader) -> None:
         cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("jobs").delete(str(header.id), ignore_keyerror=True)
+        path = f"jobs/{header.id}"
+        if path in cfg:
+            del cfg[path]
+            cfg.write()
 
     # Add created schedules to the config DB, and increase the
     # last_schedule_id parameter.
     async def _cfg_sched_create(self, header: job.CronHeader) -> None:
         cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("cron").set(str(header.id), header.as_dict())
+        cfg[f"cron/{header.id}"] = header.as_dict()
+        cfg.write()
 
-        self.monkycfg.get_and_set(
-            "last_schedule_id",
-            lambda val: max(cast(int, val), header.id)
-        )
+        last_id = cast(int, self.monkycfg["last_schedule_id"])
+        self.monkycfg["last_schedule_id"] = max(last_id, header.id)
+        self.monkycfg.write()
 
     # Remove deleted schedules from the config DB.
     async def _cfg_sched_delete(self, header: job.CronHeader) -> None:
         cfg = self.get_jobcfg_for_header(header)
-        cfg.sub("cron").delete(str(header.id))
+        path = f"cron/{header.id}"
+        if path in cfg:
+            del cfg[path]
+            cfg.write()
 
     # DISCORD LINKS
 
@@ -201,8 +217,11 @@ class Saru:
     # Called from on_ready() to ensure that all discord state is init'd
     # properly
     async def resume_jobs(self) -> None:
-        for guild_id, cfg in self.job_db.db.items():
-            jobs = cfg.sub("jobs").get_and_clear()
+        for guild_id, cfg in self.job_db.items():
+            # Get a copy of the job dict and clear it.
+            jobs = dict(cfg.sub("jobs").root)
+            cfg["jobs"] = {}
+            cfg.write()
 
             for job_id, job_header in jobs.items():
                 await self.resume_job(typing.cast(Mapping, job_header))
@@ -217,8 +236,10 @@ class Saru:
 
     # Reschedule all cron entries from cfg
     async def reschedule_all_cron(self) -> None:
-        for guild_id, cfg in self.job_db.db.items():
-            crons = cfg.sub("cron").get_and_clear()
+        for guild_id, cfg in self.job_db.items():
+            crons = dict(cfg.sub("cron").root)
+            cfg["cron"] = {}
+            cfg.write()
 
             for sched_id, sched_header in crons.items():
                 await self.reschedule_cron(typing.cast(Mapping, sched_header))
@@ -235,11 +256,11 @@ class Saru:
         # TODO Investigate bug in fetch_my_guilds: newest_first appears to repeat guilds?
         async for guild in self.bot.rest.fetch_my_guilds():
             logger.info("In guilds: {}({})".format(guild.name, guild.id))
-            _ = self.config_db.get_config(guild.id)
-            _ = self.job_db.get_config(guild.id)
+            self.guild_config_directory.ensure_exists(guild.id)
+            self.job_db.ensure_exists(guild.id)
 
-        self.config_db.write_db()
-        self.job_db.write_db()
+        self.guild_config_directory.write()
+        self.job_db.write()
 
     async def on_bot_ready(self, event: hikari.StartedEvent) -> None:
         """Function to call when bot is started and connected. This function MUST be called in order for jobs to
@@ -314,33 +335,37 @@ class Saru:
         guild_entity: GuildEntity,
         path: Optional[str] = None,
         force_create: bool = False
-    ) -> config.PathConfigProtocol:
+    ) -> config.Config:
         """Shortcut to get guild cfg, or a subconfig of one."""
 
         id = guild_id_from_entity(guild_entity)
-        cfg = self.config_db.get_config(id)
+        self.guild_config_directory.ensure_exists(id)
+        cfg = self.guild_config_directory[id]
 
         if path is None:
             return cfg
         else:
-            if force_create:
-                cfg.path_create(path)
+            return cfg.sub(path, ensure_exists=force_create)
 
-            return cfg.path_sub(path)
-
-    def ccfg(self, path: str, force_create: bool = False) -> config.PathConfigProtocol:
+    def ccfg(self, path: str, force_create: bool = False) -> config.Config:
         """Shortcut to get common cfg."""
-        if force_create:
-            self.common_config_db.path_create(path)
+        common_name, *sub_path = config.cfg_path_parse(path)
 
-        return self.common_config_db.path_sub(path)
+        if force_create:
+            self.common_config_directory.ensure_exists(common_name)
+
+        cfg = self.common_config_directory[common_name]
+        if sub_path:
+            return cfg.sub(config.cfg_path_build(sub_path), ensure_exists=force_create)
+        else:
+            return cfg
 
     def cfg(
         self,
         path: str,
         guild_entity: Optional[GuildEntity] = None,
         force_create: bool = False
-    ) -> config.PathConfigProtocol:
+    ) -> config.Config:
         """Combined shortcut method for getting config objects.
 
         Provided paths must take one of the following forms:
@@ -349,7 +374,7 @@ class Saru:
 
         If a g/... path is used, guild_entity must not be None.
         """
-        pathtype, *rest = config.CONFIG_PATH_SPLIT.split(path, 1)
+        pathtype, *rest = config.cfg_path_parse(path)
 
         if pathtype == "g":
             if guild_entity is None:
@@ -358,14 +383,14 @@ class Saru:
             if not rest:
                 sub_path = None
             else:
-                sub_path = rest[0]
+                sub_path = config.cfg_path_build(rest)
 
             return self.gcfg(guild_entity, sub_path, force_create)
         elif pathtype == "c":
             if not rest:
                 raise ValueError("must provide config name for c/... path")
             else:
-                sub_path = rest[0]
+                sub_path = config.cfg_path_build(rest)
 
             return self.ccfg(sub_path, force_create)
         else:
@@ -564,7 +589,7 @@ class GuildStateBase:
     def __init__(self, bot: lightbulb.BotApp, guild: hikari.Guild):
         self.bot = bot
         self.guild = guild
-        self.__cfg: Optional[config.PathConfigProtocol] = None
+        self.__cfg: Optional[config.Config] = None
         self.__cfg_set_from_deco = False
 
         cfg_path = type(self)._cfg_path
@@ -573,7 +598,7 @@ class GuildStateBase:
             self.__cfg_set_from_deco = True
 
     @property
-    def cfg(self) -> Optional[config.PathConfigProtocol]:
+    def cfg(self) -> Optional[config.Config]:
         """Get the config backing this guild state.
 
         Will be None unless the @config_backed decorator is used.
@@ -581,7 +606,7 @@ class GuildStateBase:
         return self.__cfg
 
     @cfg.setter
-    def cfg(self, c: config.PathConfigProtocol) -> None:
+    def cfg(self, c: config.Config) -> None:
         """Set the config backing this guild state.
 
         If @config_backed was used, this may not be changed.
@@ -724,9 +749,9 @@ class ConfigCallbackProtocol(Protocol):
     def __call__(
         self,
         ctx: lightbulb.Context,
-        cfg: config.ConfigProtocol,
+        cfg: config.Config,
         key: str,
-        value: config.ConfigValue
+        value: config.ConfigValueT
     ) -> Coroutine[Any, Any, None]: ...
 
 
@@ -778,12 +803,13 @@ def config_command(
             if ctx.event.message.member is None:
                 raise ValueError("ctx must have a member (invoke in guild only)")
 
-            cfg: config.PathConfigProtocol = get(ctx).cfg(path, ctx.guild_id)
+            cfg: config.Config = get(ctx).cfg(path, ctx.guild_id)
             value = ctx.options.value
 
             if config_key not in cfg and default_on_non_exist is not hikari.UNDEFINED:
                 logger.warning(f"cfg_command: {config_key} set to default {default_on_non_exist}")
-                cfg.set(config_key, default_on_non_exist)
+                cfg[config_key] = default_on_non_exist
+                cfg.write()
 
             # GET
             if value is None:
@@ -818,7 +844,8 @@ def config_command(
                     return
 
             await coro(ctx, cfg, config_key, value)
-            cfg.set(config_key, value)
+            cfg[config_key] = value
+            cfg.write()
             await ack(ctx)
 
         return _

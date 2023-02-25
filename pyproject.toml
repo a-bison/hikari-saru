@@ -43,5 +43,6 @@ warn_return_any = true
 warn_unreachable = true
 
 exclude = [
-    'noxfile.py'
+    'noxfile.py',
+    'tests/'
 ]

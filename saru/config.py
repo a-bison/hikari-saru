@@ -1,483 +1,532 @@
-#
-# Config classes for dynamic, persistent configuration.
-#
-import functools
+"""
+Configuration classes.
+
+Please note that these are configuration classes, not data stores.
+They're meant to store configuration options that change infrequently,
+with a low chance of failure.
+"""
+import abc
+import collections
+import collections.abc
+import copy
 import json
 import logging
 import pathlib
 import re
-import shutil
-from collections.abc import Mapping, MutableMapping, MutableSequence
+import typing as t
 from datetime import datetime
-from typing import Any, Callable, Optional, Protocol, TypeVar, Union, cast
 
-from saru import util
+__all__ = (
+    "ConfigValueT",
+    "ConfigTV",
+    "Config",
+    "ConfigBackendProtocol",
+    "BaseConfig",
+    "BaseSubConfig",
+    "JsonConfigBackend",
+    "NullConfigBackend",
+    "InMemoryConfigBackend",
+    "JsonConfigDirectory",
+    "ConfigException",
+    "ConfigPathException",
+    "ConfigTemplate",
+    "cfg_path_parse",
+    "cfg_path_build"
+)
 
-CONFIG_PATH_SPLIT = re.compile(r"/+")
 
 logger = logging.getLogger(__name__)
 
+CONFIG_PATH_CHAR = "/"
+CONFIG_PATH_SPLIT = re.compile(r"/+")
 
-ConfigValue = Union[
+ConfigValueT = t.Union[
     str,
     int,
     bool,
     float,
-    MutableSequence[Any],
-    MutableMapping[str, Any]
+    t.MutableSequence['ConfigValueT'],
+    t.MutableMapping[str, 'ConfigValueT']
 ]
+"""
+An arbitrary configuration value. Encompasses all
+possible value types stored in a `Config` implementation.
+"""
+
+ConfigTV = t.TypeVar("ConfigTV", bound='Config')
+"""
+A type variable representing any type of `Config`.
+"""
 
 
-# NOTE: Each protocol here inherits directly from Protocol even though it's not
-# necessary, because mypy seemingly does not treat these classes as Protocols unless
-# they do so.
-
-class ConfigBaseProtocol(Protocol):
-    opts: MutableMapping[str, ConfigValue]
-
-    def write(self) -> None: ...
-    def clear(self) -> None: ...
-
-
-class ConfigProtocol(ConfigBaseProtocol, Protocol):
-    def set(self, key: str, value: ConfigValue) -> None: ...
-    def get(self, key: str) -> ConfigValue: ...
-    def delete(self, key: str, ignore_keyerror: bool = False) -> None: ...
-    def lappend(self, key: str, value: ConfigValue) -> None: ...
-    def lremove(self, key: str, value: ConfigValue) -> None: ...
-    def get_and_set(self, key: str, f: Callable[[ConfigValue], ConfigValue]) -> None: ...
-    def get_and_clear(self) -> MutableMapping[str, ConfigValue]: ...
-    def __contains__(self, item: Optional[str]) -> bool: ...
-
-
-class _HasPathSub(Protocol):
-    def sub(self, key: str) -> 'PathConfigProtocol': ...
-    def path_sub(self, path: str) -> 'PathConfigProtocol': ...
-
-
-class _ConfigWithPathSub(ConfigProtocol, _HasPathSub, Protocol):
-    ...
-
-
-class PathProtocol(_HasPathSub, Protocol):
+class Config(t.MutableMapping[str, ConfigValueT], abc.ABC):
     """
-    Protocol allowing operations on various config paths.
+    The base class for configuration objects. All changes to this object
+    are kept in memory until a call to `Config.write` (save
+    changes to persistent storage), or `Config.read` (discard
+    current changes and re-read from persistent storage).
+
+    May be treated mostly as a normal `typing.MutableMapping` with
+    some special considerations.
     """
-    def path_get(self, path: str) -> ConfigValue: ...
-    def path_set(self, path: str, value: ConfigValue) -> None: ...
-    def path_delete(self, path: str) -> None: ...
-    def path_lappend(self, path: str, value: ConfigValue) -> None: ...
-    def path_lremove(self, path: str, value: ConfigValue) -> None: ...
 
-    def path_sub_exists(self, path: str) -> bool: ...
-    def path_create(self, path: str) -> None: ...
+    @abc.abstractmethod
+    def write(self) -> None:
+        """
+        Write the contents of this configuration to persistent storage.
+        """
+        ...
 
+    @abc.abstractmethod
+    def load(self) -> None:
+        """
+        Discard in-memory changes and read values from persistent storage.
+        """
+        ...
 
-class PathConfigProtocol(ConfigProtocol, PathProtocol, Protocol):
-    ...
+    @abc.abstractmethod
+    def sub(self, key: str, ensure_exists: bool = True) -> 'Config':
+        """
+        Return a subconfig view of the passed path.
+        """
+        ...
 
+    @property
+    def root(self) -> t.MutableMapping[str, ConfigValueT]:
+        """
+        A mutable mapping allowing direct access to this config.
+        This returns `self` by default, but implementations may override this.
 
-# Mixin for basic configuration functions. Subclasses must implement ConfigBaseProtocol.
-class ConfigMixin:
-    def lappend(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
-        l = self.opts[key]
-
-        if not isinstance(l, MutableSequence):
-            raise TypeError("config item must be a list to be appended")
-
-        l.append(value)
-        self.write()
-
-    def lremove(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
-        l = self.opts[key]
-
-        if not isinstance(l, MutableSequence):
-            raise TypeError("config item must be a list to be removed from")
-
-        l.remove(value)
-        self.write()
-
-    def set(self: ConfigBaseProtocol, key: str, value: ConfigValue) -> None:
-        self.opts[key] = value
-        self.write()
-
-    def get(self: ConfigBaseProtocol, key: str) -> ConfigValue:
-        return self.opts[key]
-
-    def get_and_set(
-        self: ConfigBaseProtocol,
-        key: str,
-        f: Callable[[ConfigValue], ConfigValue]
-    ) -> None:
-        self.opts[key] = f(self.opts[key])
-        self.write()
-
-    def delete(self: ConfigBaseProtocol, key: str, ignore_keyerror: bool = False) -> None:
-        if ignore_keyerror and key not in self.opts:
-            return
-
-        del self.opts[key]
-        self.write()
-
-    # Clears an entire config, and returns a copy of what was just cleared.
-    def get_and_clear(self: ConfigBaseProtocol) -> MutableMapping[str, ConfigValue]:
-        cfg = dict(self.opts)
-        self.clear()
-        self.write()
-
-        return cfg
-
-    def __contains__(self: ConfigBaseProtocol, item: Optional[str]) -> bool:
-        return item is not None and item in self.opts
+        In any case, it should not be assumed that the object returned
+        by this property supports config behavior. It should be treated
+        like a dict.
+        """
+        return self
 
 
-# Enable a config to get sub-configs.
-class SubconfigMixin:
-    def sub(self: ConfigBaseProtocol, key: str) -> 'PathConfigProtocol':
-        if not isinstance(self.opts[key], MutableMapping):
-            raise TypeError(f"Cannot get subconfig for non-mapping type (key {key})")
-
-        return cast(PathConfigProtocol, SubConfig(self, key, cast(MutableMapping, self.opts[key])))
-
-
-def _path_iter(
-    cfg: ConfigBaseProtocol,
-    path: str
-) -> tuple[str, str, bool]:
-    if not path:
-        raise ValueError("path may not be empty or None")
-
-    head: str
-    rest: Union[str, list[str]]
-
-    head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
-    if rest:
-        rest = rest[0]
-    else:
-        rest = ""
-
-    return (
-        head, rest, isinstance(cfg.opts[head], MutableMapping)
-    )
-
-
-_PathifyT = TypeVar(
-    "_PathifyT",
-    Callable[[PathConfigProtocol, str], Any],
-    Callable[[PathConfigProtocol, str, ConfigValue], Any],
-    Callable[[PathConfigProtocol, str], Any],
-    Callable[[PathConfigProtocol, str, ConfigValue], Any]
-)
-
-
-def _pathify(
-    allow_self_op: bool = True
-) -> Callable[[_PathifyT], _PathifyT]:
+class ConfigBackendProtocol(t.Protocol):
     """
-    Use a function that operates on a Config, key, and optionally a ConfigValue,
-    and convert it to a function that allows a config path to be used as the key.
-
-    If allow_self_op is False, then if path does not refer to subconfigs, ex:
-
-    class OnlyPathSub:
-        def path_sub(path: str) -> PathConfigProtocol:
-            ...
-
-        _pathify(allow_self_op=False)
-        def path_get(cfg: PathConfigProtocol, key: str) -> ConfigValue:
-            return cfg.get(key)
-
-    obj = OnlyPathSub(...)
-    obj.path_get("top_level_item")
-
-    ...then, an error will be raised. This mode of operation is meant to allow
-    the creation of path functions on collections of configs that have no config
-    operations (get/set/lappend/lremove/etc...) of their own. Path functions that
-    declare allow_self_op=False MUST be called with at least one subpath, ex:
-
-    obj.path_get("top_level_cfg") #  TypeError
-    obj.path_get("top_level_cfg/item") #  OK
-    obj.path_sub("top_level_cfg") #  OK
+    The protocol for configuration backends. Implements the persistence part of
+    `BaseConfig` objects.
     """
-    def deco(
-        f: _PathifyT
-    ) -> _PathifyT:
-        # Haha this is messy and gross
-        if allow_self_op:
-            @functools.wraps(f)
-            def _(cfg: PathConfigProtocol, path: str, *args: Any) -> Any:
-                tail: str
-                rest: Union[str, list[str]]
 
-                *rest, tail = path.rsplit("/", 1)
+    def write(self, data: t.Mapping[str, ConfigValueT]) -> None:
+        """
+        Write data to persistent storage.
+        """
+        ...
 
-                if not rest:
-                    return f(cfg, tail, *args)
+    def read(self) -> t.MutableMapping[str, ConfigValueT]:
+        """
+        Read data from persistent storage.
+        """
+        ...
+
+
+class ConfigException(BaseException):
+    """
+    Raised for generic failures in the configuration system.
+    """
+    pass
+
+
+class ConfigPathException(ConfigException):
+    """
+    Raised on errors following configuration paths.
+    """
+    pass
+
+
+class NullConfigBackend(ConfigBackendProtocol):
+    """
+    A config backend that does nothing. Reading from
+    this backend produces an empty dictionary. Mainly
+    for testing purposes.
+    """
+
+    def write(self, data: t.Mapping[str, ConfigValueT]) -> None: ...
+
+    def read(self) -> t.MutableMapping[str, ConfigValueT]:
+        return {}
+
+
+def cfg_path_parse(path: str) -> t.Sequence[str]:
+    """
+    Parse a path string into a sequence of config keys.
+    Empty strings are ignored, so for example `/foo/bar/` and `foo/bar` are
+    the same thing.
+    """
+    return [item for item in CONFIG_PATH_SPLIT.split(path) if item]
+
+
+def cfg_path_build(path: t.Sequence[str]) -> str:
+    """
+    Build a path string out of a sequence of config keys.
+    """
+    return CONFIG_PATH_CHAR.join(path)
+
+
+class BaseConfig(Config):
+    """
+    The standard configuration implementation. Defers the persistence
+    part to a passed `ConfigBackendProtocol`, but implements everything
+    else.
+    """
+    def __init__(self, backend: ConfigBackendProtocol):
+        self.backend = backend
+        self.__data: t.MutableMapping[str, ConfigValueT] = {}
+
+    def write(self) -> None:
+        self.backend.write(self.__data)
+
+    def load(self) -> None:
+        self.__data = self.backend.read()
+
+    @staticmethod
+    def __subdata_path_error(full_path: t.Sequence[str], error_path: t.Sequence[str], msg: str) -> t.NoReturn:
+        raise ConfigPathException(
+            f"Could not get subconfig at \"{cfg_path_build(full_path)}\": " +
+            f"Item at \"{cfg_path_build(error_path)}\" {msg.lower()}"
+        )
+
+    def __get_subdata(
+        self,
+        path: t.Sequence[str],
+        create_subdata: bool = False
+    ) -> t.MutableMapping[str, ConfigValueT]:
+        """
+        Traverse the config tree based on `path` and return the corresponding
+        internal subconfig, if it exists. If `create_subdata` is true,
+        missing tree nodes will be created during the traversal, guaranteeing
+        that a subconfig will be returned.
+
+        Raises:
+            ConfigPathError: In cases where an item in the path cannot be located,
+                or is of invalid type.
+        """
+        subdata: t.MutableMapping[str, ConfigValueT] = self.__data
+        traversed: t.MutableSequence[str] = []
+
+        # traverse path and find the pointed subdata
+        for path_item in path:
+            if path_item not in subdata:
+                if create_subdata:
+                    subdata[path_item] = {}
                 else:
-                    return f(cfg.path_sub(rest[0]), tail, *args)
-        else:
-            @functools.wraps(f)
-            def _(cfg: PathConfigProtocol, path: str, *args: Any) -> Any:
-                tail: str
-                rest: Union[str, list[str]]
+                    self.__subdata_path_error(path, [*traversed, path_item], "does not exist.")
 
-                *rest, tail = path.rsplit("/", 1)
+            # Item exists. Check to see if it's a mapping, so we can continue.
+            potential_subdata = subdata[path_item]
+            if not isinstance(potential_subdata, collections.abc.MutableMapping):
+                self.__subdata_path_error(path, [*traversed, path_item], "is not a mapping.")
+            else:
+                # Success, so update subdata and traversal tracking
+                subdata = potential_subdata
+                traversed.append(path_item)
 
-                if not rest:
-                    raise TypeError(f"{type(cfg)} has no config operations.")
-                else:
-                    # Same as above.
-                    return f(cfg.path_sub(rest[0]), tail, *args)
+        return subdata
 
-        # Ignore mypy error here so we can use varargs for an option value argument.
-        return _  # type: ignore
+    def __get_subdata_and_key(
+        self,
+        path: str,
+        create_subdata: bool = False
+    ) -> t.Tuple[t.MutableMapping[str, ConfigValueT], str]:
+        """
+        Traverse the config tree based on `path`, and return the corresponding
+        subconfig and key. For example, `__get_subdata_and_key("foo/bar/baz")`
+        would return the configuration pointed to by `foo/bar`, and the string
+        `"baz"`. These may then be further used for operations on the subconfig.
+        """
+        parsed_path = cfg_path_parse(path)
 
-    return deco
+        if not parsed_path:
+            raise ConfigPathException(f"Path \"{path}\" does not reference anything. Empty config names are not allowed.")
 
+        if len(parsed_path) == 1:
+            # In the case of one path element, skip the traversal step.
+            return self.__data, parsed_path[0]
 
-class ConfigPathMixin:
-    def path_sub(self: _ConfigWithPathSub, path: str) -> PathConfigProtocol:
-        if not path:
-            raise ValueError("path may not be empty or None")
+        *subconfig_path, key = parsed_path
+        return self.__get_subdata(subconfig_path, create_subdata), key
 
-        head, rest, is_dict = _path_iter(self, path)
+    def sub(self, key: str, ensure_exists: bool = True) -> Config:
+        # Attempt to get subdata. This will raise any appropriate exceptions
+        # should there be a problem with the path.
+        self.__get_subdata(cfg_path_parse(key), create_subdata=ensure_exists)
+        return BaseSubConfig(self, path=key)
 
-        if not rest:
-            # Hit end of path, so return the subconfig
-            return self.sub(head)
-        elif rest and not is_dict:
-            # Hit end of config, but we still have path left. Error in this case.
-            raise ValueError("configpath too long")
-        else:
-            # Not and end of path or config, so keep going
-            return self.sub(head).path_sub(rest)
+    @property
+    def root(self) -> t.MutableMapping[str, ConfigValueT]:
+        """
+        A mutable mapping allowing direct access to config data.
+        """
+        return self.__data
 
-    def path_sub_exists(self: _ConfigWithPathSub, path: str) -> bool:
-        try:
-            self.path_sub(path)
+    def __setitem__(self, key: str, value: ConfigValueT) -> None:
+        subconfig, key = self.__get_subdata_and_key(key, create_subdata=True)
+        subconfig[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        subconfig, key = self.__get_subdata_and_key(key, create_subdata=False)
+        del subconfig[key]
+
+    def __getitem__(self, key: str) -> ConfigValueT:
+        subconfig, key = self.__get_subdata_and_key(key, create_subdata=False)
+        return subconfig[key]
+
+    def __len__(self) -> int:
+        return len(self.__data)
+
+    def __iter__(self) -> t.Iterator[str]:
+        yield from self.__data
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, str):
+            try:
+                _ = self[key]
+            except (KeyError, ConfigPathException):
+                return False
+
             return True
-        except KeyError:
+        else:
+            logger.warning("BaseConfig: __contains__ attempt with non-str key")
             return False
 
-    def path_create(self: _ConfigWithPathSub, path: str) -> None:
-        if not path:
-            raise ValueError("path may not be empty or None")
 
-        head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
-
-        # Create if not exist
-        if head not in self:
-            self.set(head, {})
-
-        # If still more path to consume, continue.
-        if rest:
-            self.sub(head).path_create(rest[0])
-
-    @_pathify()
-    def path_get(self: _ConfigWithPathSub, key: str) -> ConfigValue:
-        return self.get(key)
-
-    @_pathify()
-    def path_set(self: _ConfigWithPathSub, key: str, value: ConfigValue) -> None:
-        self.set(key, value)
-
-    @_pathify()
-    def path_delete(self: _ConfigWithPathSub, key: str) -> None:
-        self.delete(key)
-
-    @_pathify()
-    def path_lappend(self: _ConfigWithPathSub, key: str, value: ConfigValue) -> None:
-        self.lappend(key, value)
-
-    @_pathify()
-    def path_lremove(self: _ConfigWithPathSub, key: str, value: ConfigValue) -> None:
-        self.lremove(key, value)
-
-
-class SubConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
-    def __init__(
-        self,
-        parent: ConfigBaseProtocol,
-        name: str,
-        cfg: MutableMapping[str, ConfigValue]
-    ):
-        super().__init__()
-
+class BaseSubConfig(Config):
+    """
+    A basic subconfig implementation. Note that this is intended to
+    be constructed by `BaseConfig`, which does some work to ensure the
+    methods defined here are valid.
+    """
+    def __init__(self, parent: Config, path: str):
         self.parent = parent
-        self.opts = cfg
-        self.name = name
-
-        self.invalid = False
-
-    # On clear, we create a new dict in the parent and set our reference
-    # to the new storage.
-    def clear(self) -> None:
-        self.parent.opts[self.name] = {}
-        self.opts = cast(MutableMapping[str, ConfigValue], self.parent.opts[self.name])
+        self.path = path
 
     def write(self) -> None:
         self.parent.write()
 
+    def load(self) -> None:
+        self.parent.load()
 
-class ConfigException(Exception):
-    pass
+    def __get_true_path(self, path: str) -> str:
+        # Parse path to normalize it. If we get nothing, then a blank
+        # string or equivalent was passed in, so error.
+        parsed = cfg_path_parse(path)
+
+        if not parsed:
+            raise ConfigPathException(f"Path \"{path}\" does not reference anything. Empty config names are not allowed.")
+
+        return cfg_path_build([self.path, *parsed])
+
+    def sub(self, key: str, ensure_exists: bool = True) -> Config:
+        return self.parent.sub(self.__get_true_path(key), ensure_exists=ensure_exists)
+
+    @property
+    def __safe_dict(self) -> t.MutableMapping[str, ConfigValueT]:
+        # Assumption: The path pointed to in our parent is a valid mapping.
+        return t.cast(t.MutableMapping[str, ConfigValueT], self.parent[self.path])
+
+    @property
+    def root(self) -> t.MutableMapping[str, ConfigValueT]:
+        return self.__safe_dict
+
+    def __setitem__(self, key: str, value: ConfigValueT) -> None:
+        self.parent[self.__get_true_path(key)] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.parent[self.__get_true_path(key)]
+
+    def __getitem__(self, key: str) -> ConfigValueT:
+        return self.parent[self.__get_true_path(key)]
+
+    def __len__(self) -> int:
+        return len(self.__safe_dict)
+
+    def __iter__(self) -> t.Iterator[str]:
+        yield from self.__safe_dict
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, str):
+            return self.__get_true_path(key) in self.parent
+        else:
+            logger.warning("BaseSubConfig: __contains__ attempt with non-str key")
+            return False
 
 
-# Simple on-disk persistent configuration for one guild (or anything else that
-# only needs one file)
-#
-# If check_date=True, before writing the config, we check to see if
-# it's been modified after we last loaded/wrote the config. If so,
-# raise an exception. Use this if you intend to edit the config manually,
-# and want to make sure your modifications aren't overwritten.
-class JsonConfig(ConfigMixin, SubconfigMixin, ConfigPathMixin):
+class InMemoryConfigBackend(ConfigBackendProtocol):
+    """
+    A configuration backend that stores information in a dictionary.
+    All information will be lost on application close. Mainly used
+    for testing read/write.
+    """
+    def __init__(self) -> None:
+        self.__data: t.MutableMapping[str, ConfigValueT] = {}
+
+    def write(self, data: t.Mapping[str, ConfigValueT]) -> None:
+        self.__data = {}
+        self.__data.update(copy.deepcopy(data))
+
+    def read(self) -> t.MutableMapping[str, ConfigValueT]:
+        return copy.deepcopy(self.__data)
+
+    @property
+    def data(self) -> t.MutableMapping[str, ConfigValueT]:
+        return self.__data
+
+
+class ConfigTemplate:
+    """
+    A configuration template. Describes all the configuration
+    paths that must exist in a `Config` object and what their initial
+    values should be.
+    """
     def __init__(
         self,
-        path: pathlib.Path,
-        template: Optional[Mapping] = None,
+        paths: t.Mapping[str, ConfigValueT],
+        rollback_on_failure: bool = False
+    ):
+        self.template = copy.deepcopy(paths)
+        self.rollback_on_failure = rollback_on_failure
+
+    def __rollback(self, config: Config) -> None:
+        """
+        Roll back a config object. Only applies if self.rollback_on_failure
+        is True.
+        """
+        if self.rollback_on_failure:
+            # Load last written data on failure.
+            logger.warning("ConfigTemplate: rolling back...")
+            config.load()
+            logger.warning("ConfigTemplate: rollback success.")
+
+    def apply(self, config: Config) -> None:
+        """
+        Apply this template to the given config. Does not write anything,
+        so on success should be followed up with a call to `Config.write`.
+        """
+        for path, value in self.template.items():
+            if path not in config:
+                try:
+                    config[path] = value
+                except (ConfigPathException, KeyError):
+                    logger.error(f"ConfigTemplate: Could not apply value {value} to \"{path}\"")
+                    self.__rollback(config)
+                    raise
+
+
+class JsonConfigBackend(ConfigBackendProtocol):
+    """
+    A configuration backend that stores information in a human-readable
+    JSON file.
+    """
+    def __init__(
+        self,
+        path: t.Union[str, pathlib.Path],
         check_date: bool = False
     ):
-        super().__init__()
-
-        self.opts = cast(MutableMapping[str, ConfigValue], {})
-        self.path = path
-        self.template = {} if template is None else template
-        self.check_date = check_date
-        self.last_readwrite_date = 0.0
-        self.init()
-
-    def init(self) -> None:
-        if self.path.exists():
-            self.load()
+        # We accept str or pathlib.Path, but internally it's always
+        # a Path instance.
+        if isinstance(path, str):
+            self.path = pathlib.Path(path)
         else:
-            self.create()
+            self.path = path
+
+        self.check_date = check_date
+        self.__last_readwrite_date = 0.0
 
     def __update_last_date(self) -> None:
-        self.last_readwrite_date = round(datetime.now().timestamp(), 4)
+        self.__last_readwrite_date = round(datetime.now().timestamp(), 4)
 
-    def load(self) -> None:
-        template = self.template
-
-        with open(self.path, 'r') as f:
-            self.opts = dict(json.load(f))
-
-        # On load, force update last date. If the json file modify
-        # date has been brought past this by a manual edit, write()
-        # will refuse to complete unless load() is called again.
-        # (only if self.check_date=True)
-        self.__update_last_date()
-
-        if template:
-            template_additions = False
-
-            for key, value in self.template.items():
-                if key not in self.opts:
-                    self.opts[key] = template[key]
-                    template_additions = True
-
-            # Do not write unless we make changes here.
-            if template_additions:
-                self.write()
-
-    def create(self) -> None:
-        if self.template is not None:
-            self.opts = dict(self.template)
-
-        self.write()
-
-    def clear(self) -> None:
-        self.opts = {}
-
-    def write(self) -> None:
+    def write(self, data: t.Mapping[str, ConfigValueT]) -> None:
         if self.path.exists() and self.check_date:
             file_timestamp = round(self.path.stat().st_mtime, 4)
 
             # If file was modified after last load/write,
             # refuse to write.
-            if file_timestamp > self.last_readwrite_date:
+            if file_timestamp > self.__last_readwrite_date:
                 msg = "{} has been modified, config must be reloaded"
-                logger.error(util.longstr_oneline(f"""
-                    check_date conflict: {self.path}:
-                    {file_timestamp} > {self.last_readwrite_date}
-                    (file_timestamp > self.last_readwrite_date)
-                """))
+                logger.error(
+                    f"check_date conflict: {self.path}: "
+                    f"{file_timestamp} > {self.__last_readwrite_date} "
+                    "(file_timestamp > self.__last_readwrite_date)"
+                )
                 raise ConfigException(msg.format(self.path))
 
         with open(self.path, 'w') as f:
-            json.dump(self.opts, f, indent=4)
+            json.dump(data, f, indent=4)
 
         self.__update_last_date()
 
+    def read(self) -> t.MutableMapping[str, ConfigValueT]:
+        if not self.path.exists():
+            logger.warning(f"JSON config store at {self.path} does not exist, creating.")
+            self.write({})
+            return {}
 
-# Very simple config database consisting of json files on disk.
-# Saves a different version of the config depending on the ID.
-#
-# On disk structure:
-# config_root_dir \_ common.json
-#                 |_ <id_1>.json
-#                 |_ <id_2>.json
-#
-class JsonConfigDB:
+        with open(self.path, 'r') as f:
+            data = dict(json.load(f))
+
+        self.__update_last_date()
+
+        return data
+
+
+class JsonConfigDirectory(t.Mapping[t.Union[int, str], Config]):
     def __init__(
-            self,
-            path: pathlib.Path,
-            template: Optional[Mapping] = None,
-            unique_template: bool = False
+        self,
+        path: t.Union[str, pathlib.Path],
+        template: t.Union[ConfigTemplate, t.Mapping[str, ConfigTemplate], None] = None
     ):
-        self.db: MutableMapping[str, JsonConfig] = {}
+        self.data: t.MutableMapping[str, Config] = {}
+        self.template = template
 
-        self.path = path
-        self.template: Mapping[str, Mapping] = template if template is not None else {}
-        self.unique_template = unique_template
+        # We accept str or pathlib.Path, but internally it's always
+        # a Path instance.
+        if isinstance(path, str):
+            self.path = pathlib.Path(path)
+        else:
+            self.path = path
 
-        if path.is_dir():
-            self.load_db()
-        elif path.exists():
-            msg = "config {} is not a directory"
-            raise FileExistsError(msg.format(str(path)))
-        else:  # No file or dir, so create new
-            self.create_new_db()
+    def __apply_template(self, s_cid: str) -> None:
+        """
+        Attempt to apply the configured template for the named configuration.
+        """
+        if self.template is None:
+            return
 
-    # Creates a new config DB
-    def create_new_db(self) -> None:
-        try:
-            self.path.mkdir()
-        except FileNotFoundError:
-            logger.error("Parent directories of config not found.")
-            raise
+        conf = self.data[s_cid]
 
-    # Backup the entire configuration to a given path.
-    def backup(self, parent_path: pathlib.Path) -> None:
-        path = self.backup_loc(parent_path)
+        if isinstance(self.template, ConfigTemplate):
+            # Single mode. Use the same template for everything.
+            self.template.apply(conf)
+        elif isinstance(self.template, collections.abc.Mapping):
+            # Unique mode. Use a different template for each config.
+            if s_cid not in self.template:
+                # If not present, don't fail, but print warning.
+                logger.warning(f"JsonConfigDictionary: unique template: none for {s_cid}")
+                return
 
-        if path.exists():
-            shutil.rmtree(path)
+            template = self.template[s_cid]
+            template.apply(conf)
+        else:
+            raise TypeError(f"Invalid template type {str(type(self.template))}")
 
-        logger.info(f"cfgdb: backup {self.path} to {path}")
-        shutil.copytree(self.path, path)
-
-    def cfg_loc(self, cid: Union[int, str]) -> pathlib.Path:
+    def cfg_location(self, cid: t.Union[int, str]) -> pathlib.Path:
         return self.path / (str(cid) + ".json")
 
-    def backup_loc(self, parent_dir: pathlib.Path) -> pathlib.Path:
-        return parent_dir / (self.path.name + ".backup")
+    def new_config(self, cid: t.Union[int, str]) -> Config:
+        """
+        Create a new configuration in this directory and return it.
+        Performs no assignment or write operations.
+        """
+        return BaseConfig(JsonConfigBackend(self.cfg_location(cid)))
 
-    def get_template(self, cid: Union[int, str]) -> Mapping:
-        if self.unique_template:
-            cid = str(cid)
-
-            if cid in self.template:
-                return self.template[cid]
-            else:
-                return {}
-        else:
-            return self.template
-
-    # Loads the entire DB from a directory on disk.
-    # Note that this will override any configuration currently loaded in
-    # memory.
-    def load_db(self) -> None:
-        self.db = {}
+    def __read_all(self) -> None:
+        """
+        Read all configuration files within the directory.
+        """
+        self.data = {}
 
         for child in self.path.iterdir():
             try:
@@ -485,80 +534,86 @@ class JsonConfigDB:
             except ValueError:
                 continue
 
-            template = self.get_template(cid)
-            self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
-            logger.info("Load config: id {}".format(cid))
+            # Create a config object and load it.
+            self.data[cid] = self.new_config(cid)
+            self.data[cid].load()
 
-    def write_db(self) -> None:
-        for cfg in self.db.values():
+            # Apply template on read.
+            self.__apply_template(cid)
+
+    def __create_dir(self) -> None:
+        """
+        Create a new directory. The parent of the set path `self.path` must
+        exist.
+        """
+        try:
+            logger.info(f"JsonConfigDirectory: \"{self.path}\": try create")
+            self.path.mkdir()
+            logger.info(f"JsonConfigDirectory: \"{self.path}\" created")
+        except FileNotFoundError:
+            logger.error(f"JsonConfigDirectory: \"{self.path}\": one or more parents do not exist")
+            raise
+
+    def load(self) -> None:
+        """
+        Load the config directory, creating a new one if it doesn't exist.
+        """
+        if self.path.is_dir():
+            self.__read_all()
+        elif self.path.exists():
+            raise FileExistsError(f"JsonConfigDirectory: \"{self.path}\": must be a directory.")
+        else:
+            # Does not exist, so create new dir
+            self.__create_dir()
+
+    def write(self) -> None:
+        """
+        Write all config files.
+        """
+        for cfg in self.data.values():
             cfg.write()
 
-    # Gets the config for a single guild. If the config for a guild doesn't
-    # exist, create it.
-    def get_config(self, cid: Union[int, str]) -> PathConfigProtocol:
-        cid = str(cid)
-
-        if cid not in self.db:
-            self.create_config(cid)
-
-        return self.db[cid]
-
-    def create_config(self, cid: Union[int, str]) -> None:
-        cid = str(cid)
-        template = self.get_template(cid)
-
-        self.db[cid] = JsonConfig(self.cfg_loc(cid), template)
-
-    def path_sub(self, path: str) -> 'PathConfigProtocol':
-        if not path:
-            raise ValueError("path may not be empty or None")
-
-        head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
-
-        cfg: PathConfigProtocol = self.get_config(head)
-
-        if not rest:
-            return cfg
-        else:
-            return cfg.path_sub(rest[0])
-
-    def path_sub_exists(self, path: str) -> bool:
+    # Get a configuration object.
+    def __getitem__(self, cid: t.Union[int, str]) -> Config:
         try:
-            self.path_sub(path)
-            return True
+            return self.data[str(cid)]
         except KeyError:
+            logger.error("JsonConfigDirectory: __getitem__(\"{cid}\") miss. Try \"create_config\" first.")
+            raise
+
+    # Get the number of configuration objects currently loaded.
+    def __len__(self) -> int:
+        return len(self.data)
+
+    # Iterate over stored IDs.
+    def __iter__(self) -> t.Iterator[str]:
+        yield from self.data
+
+    # Test if this config directory contains the given ID
+    def __contains__(self, cid: object) -> bool:
+        if isinstance(cid, (int, str)):
+            return str(cid) in self.data
+        else:
+            logger.warning("JsonConfigDirectory: __contains__ attempt with non-str/int key")
             return False
 
-    def path_create(self, path: str) -> None:
-        if not path:
-            raise ValueError("path may not be empty or None")
+    def create_config(self, cid: t.Union[int, str]) -> Config:
+        """
+        Create a new config, overwriting anything that was there previously.
+        Returns the newly created config object.
+        """
+        s_cid = str(cid)
 
-        head, *rest = CONFIG_PATH_SPLIT.split(path, 1)
+        self.data[s_cid] = self.new_config(cid)
+        self.__apply_template(s_cid)
+        self.data[s_cid].write()
 
-        # get_config creates if nonexist
-        cfg = self.get_config(head)
+        return self.data[s_cid]
 
-        if rest:
-            cfg.path_create(rest[0])
+    def ensure_exists(self, cid: t.Union[int, str]) -> None:
+        """
+        Make sure a config exists.
+        """
+        if cid not in self:
+            self.create_config(cid)
 
-    # TODO: This is ugly as sin, almost an exact repeat of the path
-    #       functions from ConfigPathMixin. Find a better way to do this.
-    @_pathify(allow_self_op=False)
-    def path_get(cfg: PathConfigProtocol, key: str) -> ConfigValue: # noqa
-        return cfg.get(key)
-
-    @_pathify(allow_self_op=False)
-    def path_set(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
-        cfg.set(key, value)
-
-    @_pathify(allow_self_op=False)
-    def path_delete(cfg: PathConfigProtocol, key: str) -> None: # noqa
-        cfg.delete(key)
-
-    @_pathify(allow_self_op=False)
-    def path_lappend(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
-        cfg.lappend(key, value)
-
-    @_pathify(allow_self_op=False)
-    def path_lremove(cfg: PathConfigProtocol, key: str, value: ConfigValue) -> None: # noqa
-        cfg.lremove(key, value)
