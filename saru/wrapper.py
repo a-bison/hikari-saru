@@ -105,6 +105,7 @@ class Saru:
     ):
         self.bot = bot
         self.loop = asyncio.get_event_loop()
+        self.config_path = config_path
 
         self.__guild_cfgtemplate = guild_cfgtemplate
 
@@ -123,10 +124,12 @@ class Saru:
             config_path / "guildcfg",
             template=self.__guild_cfgtemplate
         )
+        self.guild_config_directory.load()
         self.common_config_directory = config.JsonConfigDirectory(
             config_path / "commoncfg",
             template=self.__common_cfgtemplate
         )
+        self.common_config_directory.load()
         self.job_db = config.JsonConfigDirectory(
             config_path / "jobdb",
             template=config.ConfigTemplate(
@@ -137,6 +140,7 @@ class Saru:
                 }
             )
         )
+        self.job_db.load()
         self.gs_db = GuildStateDB(self.bot)
 
         self.common_config_directory.ensure_exists(SARU_INTERNAL_CFG)
