@@ -13,6 +13,7 @@ import json
 import logging
 import pathlib
 import re
+import shutil
 import typing as t
 from datetime import datetime
 
@@ -123,7 +124,7 @@ class ConfigBackendProtocol(t.Protocol):
         ...
 
 
-class ConfigException(BaseException):
+class ConfigException(Exception):
     """
     Raised for generic failures in the configuration system.
     """
@@ -512,8 +513,25 @@ class JsonConfigDirectory(t.Mapping[t.Union[int, str], Config]):
         else:
             raise TypeError(f"Invalid template type {str(type(self.template))}")
 
+    def backup(self, parent_path: pathlib.Path) -> None:
+        """
+        Back up the entire configuration to a given directory.
+        For example, if `parent_path` is "example/config", the resulting
+        backup will be created at "example/config/BACKUP_NAME".
+        """
+        path = self.backup_location(parent_path)
+
+        if path.exists():
+            shutil.rmtree(path)
+
+        logger.info(f"JsonConfigDirectory: backup \"{self.path}\" to \"{path}\"")
+        shutil.copytree(self.path, path)
+
     def cfg_location(self, cid: t.Union[int, str]) -> pathlib.Path:
         return self.path / (str(cid) + ".json")
+
+    def backup_location(self, parent_path: pathlib.Path) -> pathlib.Path:
+        return parent_path / (self.path.name + ".backup")
 
     def new_config(self, cid: t.Union[int, str]) -> Config:
         """
