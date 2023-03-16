@@ -382,7 +382,7 @@ class Saru:
 
         if pathtype == "g":
             if guild_entity is None:
-                raise ValueError("guild_entity must not be None for g/... paths")
+                raise config.ConfigException("guild_entity must not be None for g/... paths")
 
             if not rest:
                 sub_path = None
@@ -392,13 +392,13 @@ class Saru:
             return self.gcfg(guild_entity, sub_path, force_create)
         elif pathtype == "c":
             if not rest:
-                raise ValueError("must provide config name for c/... path")
+                raise config.ConfigException("must provide config name for c/... path")
             else:
                 sub_path = config.cfg_path_build(rest)
 
             return self.ccfg(sub_path, force_create)
         else:
-            raise ValueError("first config node must be either g or c")
+            raise config.ConfigException("first config node must be either g or c")
 
     # Shortcut to get the guild state for a given discord object.
     # Supports ctx, ints, guilds, and anything else that has a
