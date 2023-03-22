@@ -64,7 +64,7 @@ class Config(t.MutableMapping[str, ConfigValueT], abc.ABC):
     """
     The base class for configuration objects. All changes to this object
     are kept in memory until a call to `Config.write` (save
-    changes to persistent storage), or `Config.read` (discard
+    changes to persistent storage), or `Config.load` (discard
     current changes and re-read from persistent storage).
 
     May be treated mostly as a normal `typing.MutableMapping` with
