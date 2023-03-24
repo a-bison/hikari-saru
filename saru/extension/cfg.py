@@ -1,17 +1,5 @@
 """
-A debug extension allowing access to saru internals for debug purposes.
-This extension is entirely optional, and offers none of the core services.
-See `saru.wrapper.attach` for that.
-
-To use:
-
-```python
-bot: lightbulb.BotApp(...)
-
-# Make sure saru is attached before loading the extension.
-saru.attach(bot, ...)
-bot.load_extension("saru.plugin")
-```
+The `cfg` subcommand implementation.
 """
 
 import collections.abc
@@ -24,11 +12,6 @@ import lightbulb
 import saru
 
 logger = logging.getLogger(__name__)
-
-plugin = lightbulb.Plugin(
-    "saru",
-    "hikari-saru debug commands."
-)
 
 CfgOperationCallbackT = t.Callable[[saru.Config, str], None]
 CfgValueOperationCallbackT = t.Callable[[saru.Config, str, saru.ConfigValueT], None]
@@ -183,25 +166,8 @@ def as_cfg_write_command(
     return decorator
 
 
-@plugin.command()
-@lightbulb.set_help(
-    "Run without arguments for a basic info message."
-)
-@lightbulb.add_checks(lightbulb.owner_only)
-@lightbulb.command(
-    "sr",
-    "Commands for saru debug. Bot owner only.",
-    aliases=["saru"]
-)
-@lightbulb.implements(lightbulb.PrefixCommandGroup)
-async def sr(ctx: lightbulb.Context) -> None:
-    await ctx.respond(
-        f"`hikari-saru` version `{saru.__version__}` is attached correctly.\n"
-        f"Run `{ctx.prefix}help sr` for help."
-    )
-
-
-@sr.child()  # type: ignore
+# Note: child() call is missing intentionally, this subcommand
+# is attached to `sr` later through `attach_subcommand`
 @lightbulb.add_checks(lightbulb.owner_only)
 @lightbulb.command(
     "cfg",
@@ -343,9 +309,5 @@ def cfg_remove(cfg: saru.Config, key: str, value: saru.ConfigValueT) -> None:
         item.remove(value)
 
 
-def load(bot: lightbulb.BotApp) -> None:
-    bot.add_plugin(plugin)
-
-
-def unload(bot: lightbulb.BotApp) -> None:
-    bot.remove_plugin(plugin)
+def attach_subcommand(parent: lightbulb.CommandLike) -> None:
+    parent.child(cfg)  # type: ignore

@@ -27,7 +27,7 @@ homepage = "https://github.com/a-bison/hikari-saru"
 repository = "https://github.com/a-bison/hikari-saru"
 
 [tool.setuptools]
-packages = ["saru"]
+packages = ["saru", "saru.extension"]
 
 [tool.setuptools.dynamic]
 version = {attr = "saru.__version__"}
