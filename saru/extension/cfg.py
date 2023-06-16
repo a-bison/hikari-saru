@@ -21,6 +21,23 @@ CfgCommandCallbackT = t.Union[
     CfgValueOperationCallbackT
 ]
 
+test_suite: saru.TestSuite[lightbulb.Context] = saru.TestSuite()
+saru.add_command_tests(
+    test_suite,
+    [
+        "sr cfg ls g",
+        "sr cfg ls c",
+        f"sr cfg ls c/{saru.SARU_INTERNAL_CFG}",
+        f"sr cfg get c/{saru.SARU_INTERNAL_CFG}/selftest/nonexist",
+        f"sr cfg get c/{saru.SARU_INTERNAL_CFG}/nonexist",
+        f"sr cfg set c/{saru.SARU_INTERNAL_CFG}/selftest []",
+        f"sr cfg append c/{saru.SARU_INTERNAL_CFG}/selftest \"test_value\"",
+        f"sr cfg get c/{saru.SARU_INTERNAL_CFG}/selftest",
+        f"sr cfg remove c/{saru.SARU_INTERNAL_CFG}/selftest \"test_value\"",
+        f"sr cfg delete c/{saru.SARU_INTERNAL_CFG}/selftest"
+    ]
+)
+
 
 def path_is_cfg_root(path: str) -> bool:
     """
@@ -256,6 +273,7 @@ async def cfg_get(ctx: lightbulb.Context) -> None:
             item = cfg[item_key]
     except Exception as e:
         await handle_cfg_error(ctx, e)
+        return
 
     await ctx.respond(saru.code(
         json.dumps(item, indent=4)

@@ -6,6 +6,7 @@ A personal toolkit for building discord bots with hikari-lightbulb.
 
 from .config import *
 from .job import *
+from .selftest import *
 from .util import *
 from .wrapper import *
 

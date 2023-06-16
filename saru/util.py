@@ -1,8 +1,9 @@
+import copy
 import json
 import numbers
 import textwrap
 from collections.abc import Mapping
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import hikari
 import lightbulb
@@ -51,6 +52,65 @@ def longstr_fix(s: str) -> str:
 
 def longstr_oneline(s: str) -> str:
     return " ".join(longstr_fix(s).split("\n"))
+
+
+async def respond_code_or_txt(ctx: lightbulb.Context, text: str) -> None:
+    """
+    Respond to a message with code. By default, `text` will be enclosed in ``` and posted.
+    If that message would be too large, it will be sent as a text file instead.
+    """
+    msg = code(text)
+
+    if len(msg) <= 2000:
+        await ctx.respond(msg)
+        return
+
+    # Too big, so send as file instead.
+    await ctx.respond(
+        "Response too large, sending as a `.txt` file.",
+        attachment=hikari.Bytes(text.encode('utf-8'), "response.txt")
+    )
+
+
+async def invoke_prefix_command(
+    ctx: lightbulb.PrefixContext,
+    command: str
+) -> None:
+    """
+    Programmatically invoke a lightbulb prefix command. This is accomplished by
+    copying an existing context object and making tweaks to it.
+
+    Useful for implementing aliases, or for testing.
+    """
+    invoked_prefix = ctx.prefix
+    invoked_with, *args = command.strip().split(maxsplit=1)
+    command_obj = ctx.bot.get_prefix_command(invoked_with)
+
+    if command_obj is None:
+        raise ValueError(f"Could not find command named \"{invoked_with}\"")
+
+    # Need to override the content of the message event
+    new_message = copy.deepcopy(ctx.event.message)
+    new_message.content = invoked_prefix + command
+
+    if isinstance(ctx.event, (hikari.GuildMessageCreateEvent, hikari.DMMessageCreateEvent)):
+        # Event can either be GuildMessageCreateEvent or DMMessageCreateEvent.
+        # Both take the same arguments for construction.
+        new_event = type(ctx.event)(
+            message=new_message,
+            shard=ctx.event.shard  # Use same shard.
+        )
+    else:
+        raise TypeError(f"Cannot invoke a prefix command from {str(type(ctx.event))}")
+
+    new_ctx = lightbulb.PrefixContext(ctx.bot, new_event, command_obj, invoked_with, invoked_prefix)
+
+    new_ctx._parser = (command_obj.parser or lightbulb.utils.Parser)(
+        new_ctx,
+        args[0] if args else ""
+    )
+
+    await command_obj.invoke(new_ctx)
 
 
 def rangelimit(
