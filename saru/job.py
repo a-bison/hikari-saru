@@ -203,9 +203,10 @@ class TaskRegistry:
     def force_str(self, tasktype: Union[str, Type[JobTask]]) -> str:
         return self.get(tasktype).task_type()
 
-    # Tests if a task type string is in the task registry.
-    def __contains__(self, item: str) -> bool:
-        return item in self.tasks
+    # Tests if a task type is in the task registry.
+    def __contains__(self, task_type: Union[Type[JobTask], str]) -> bool:
+        task_type_str = task_type if isinstance(task_type, str) else task_type.task_type()
+        return task_type_str in self.tasks
 
 
 # Base JobFactory functionality.
@@ -994,6 +995,7 @@ class BlockerTask(JobTask):
     # factories.
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__()
+        self.counter = 0
 
     @classmethod
     def task_type(cls) -> str:
@@ -1013,11 +1015,18 @@ class BlockerTask(JobTask):
             while True: 
                 await asyncio.sleep(1)
         else:
-            counter = time
+            self.counter = time
 
-            while counter > 0:
+            while self.counter > 0:
                 await asyncio.sleep(1)
-                counter -= 1
+                self.counter -= 1
 
     def display(self, header: JobHeader) -> str:
-        return ""
+        if header.properties['time'] is None:
+            return "time=infinite"
+        else:
+            return " ".join([
+                f"time={header.properties['time']}",
+                f"remaining={self.counter}"
+            ])
+
