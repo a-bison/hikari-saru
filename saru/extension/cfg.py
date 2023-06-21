@@ -329,3 +329,7 @@ def cfg_remove(cfg: saru.Config, key: str, value: saru.ConfigValueT) -> None:
 
 def attach_subcommand(parent: lightbulb.CommandLike) -> None:
     parent.child(cfg)  # type: ignore
+
+
+def load(bot: lightbulb.BotApp) -> None: ...
+

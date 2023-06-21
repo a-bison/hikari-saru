@@ -21,6 +21,7 @@ import lightbulb
 import saru
 
 from . import cfg
+from . import job
 
 plugin = lightbulb.Plugin(
     "saru",
@@ -29,12 +30,14 @@ plugin = lightbulb.Plugin(
 
 # Modules that are a part of this extension.
 modules: t.MutableSequence['SubCommandProtocol'] = [
-    cfg
+    cfg,
+    job
 ]
 
 
 class SubCommandProtocol(t.Protocol):
     def attach_subcommand(self, cmd: lightbulb.CommandLike) -> None: ...
+    def load(self, bot: lightbulb.BotApp) -> None: ...
 
     @property
     @abc.abstractmethod
@@ -84,6 +87,8 @@ for module in modules:
 
 def load(bot: lightbulb.BotApp) -> None:
     bot.add_plugin(plugin)
+    for mod in modules:
+        mod.load(bot)
 
 
 def unload(bot: lightbulb.BotApp) -> None:
